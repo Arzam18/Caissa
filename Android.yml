@@ -30,6 +30,10 @@ jobs:
           cd build
           make -j$(nproc)
 
+      - name: List build output
+        run: |
+          ls -la build/bin/
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
