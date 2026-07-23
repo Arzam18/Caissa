@@ -30,8 +30,22 @@ jobs:
           cd build
           make -j$(nproc)
 
-      - name: Upload binary
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: caissa-android-arm64
-          path: build/bin/caissa
+          path: |
+            build/bin/caissa
+            build/bin/eval-82-383B.pnn
+
+      - name: Create prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-build-${{ github.run_number }}
+          name: Caissa Android Build ${{ github.run_number }}
+          prerelease: true
+          files: |
+            build/bin/caissa
+            build/bin/eval-82-383B.pnn
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
