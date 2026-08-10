@@ -132,6 +132,9 @@ struct NodeInfo
     Move previousMove = Move::Invalid();
     int32_t moveStatScore = 0;
 
+    // number of beta cutoffs that occurred at this ply since the grandparent node cleared it
+    int32_t cutoffCount = 0;
+
     bool isCutNode = false;
     bool isNullMove = false;
     bool isInCheck = false;
@@ -333,7 +336,8 @@ private:
         NodeCache nodeCache;
         AccumulatorCache accumulatorCache;
         CorrectionHistories* correctionHistories = nullptr;
-        NodeInfo searchStack[MaxSearchDepth];
+        // two extra entries so the deepest node can still clear the cutoff counter two plies ahead
+        NodeInfo searchStack[MaxSearchDepth + 2];
 
         ThreadData();
         ThreadData(const ThreadData&) = delete;
@@ -365,8 +369,6 @@ private:
     void BuildMoveReductionTable(LMRTableType& table, float scale, float bias);
 
     static void WorkerThreadCallback(Search* search, uint32_t index);
-
-    ScoreType GetEvalCorrection(const CorrectionHistories* corrHist, const NodeInfo& node) const;
 
     ScoreType AdjustEvalScore(const ThreadData& thread, const NodeInfo& node, const SearchParam& searchParam) const;
 

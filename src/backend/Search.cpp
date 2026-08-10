@@ -8,6 +8,8 @@
 #include "TimeManager.hpp"
 #include "Tuning.hpp"
 
+#include <algorithm>
+
 // silent warning C4127: conditional expression is constant
 #ifdef _MSC_VER
 #pragma warning(disable: 4127)
@@ -72,6 +74,8 @@ DEFINE_PARAM(NmpNullMoveDepthReduction, 3, 1, 5);
 DEFINE_PARAM(NmpReSearchDepthReduction, 5, 1, 8);
 DEFINE_PARAM(NmpReSearchMaxDepth, 10, 5, 20);
 DEFINE_PARAM(NmpEvalBetaClamp, 3, 1, 6);
+DEFINE_PARAM(NmpCutoffCountMin, 2, 1, 4);
+DEFINE_PARAM(NmpCutoffCountBonus, 19, 0, 60);
 
 DEFINE_PARAM(LateMoveReductionStartDepth, 1, 1, 3);
 DEFINE_PARAM(LateMovePruningBase, 4, 1, 8);
@@ -140,6 +144,7 @@ DEFINE_PARAM(PriorCMHBonusBias, 100, 0, 200);
 DEFINE_PARAM(PvTTMoveMinRootDepth, 8, 4, 16);
 DEFINE_PARAM(RootSingularMaxScore, 1000, 500, 2000);
 DEFINE_PARAM(EnsureAccumulatorUpdatedDepth, 2, 0, 6);
+DEFINE_PARAM(ThreadVoteScoreOffset, 10, 0, 30);
 
 
 INLINE static uint32_t GetLateMovePruningTreshold(uint32_t depth, bool improving)
@@ -440,8 +445,7 @@ void Search::DoSearch(const Game& game, SearchParam& param, SearchResult& outRes
     // select best PV line from finished threads
     {
         uint32_t bestThreadIndex = 0;
-        uint16_t bestDepth = 0;
-        ScoreType bestScore = -InfValue;
+        ScoreType minScore = InfValue;
 
         for (uint32_t i = 0; i < param.numThreads; ++i)
         {
@@ -458,33 +462,118 @@ void Search::DoSearch(const Game& game, SearchParam& param, SearchResult& outRes
             }
 #endif // CONFIGURATION_FINAL
 
-            const PvLine& pvLine = threadData->pvLines.front();
-
-            if ((threadData->depthCompleted >= bestDepth && pvLine.score > bestScore) ||
-                (threadData->depthCompleted > bestDepth && !IsMate(bestScore)) ||
-                (IsMate(pvLine.score) && pvLine.score > bestScore))
-            {
-                bestDepth = threadData->depthCompleted;
-                bestScore = pvLine.score;
-                bestThreadIndex = i;
-            }
+            minScore = std::min(minScore, threadData->pvLines.front().score);
         }
 
-#ifndef CONFIGURATION_FINAL
+        // thread voting
         if (param.numThreads > 1)
         {
+            // each thread votes for its root move, weighted by search depth and score relative to the worst thread
+            struct MoveVotes { PackedMove move; int64_t votes; };
+            std::vector<MoveVotes> voteTable;
+
+            const auto threadWeight = [&](uint32_t i) -> int64_t
+            {
+                const ThreadData* threadData = mThreadData[i];
+                return int64_t(threadData->pvLines.front().score - minScore + ThreadVoteScoreOffset) * threadData->depthCompleted;
+            };
+
+            const auto votesOf = [&](uint32_t i) -> int64_t
+            {
+                const PackedMove move = mThreadData[i]->pvLines.front().moves.front();
+                for (const MoveVotes& entry : voteTable)
+                    if (entry.move == move)
+                        return entry.votes;
+                return 0;
+            };
+
+            // PV length is capped by the completed depth, so this stops a thread that got only
+            // one or two plies in from breaking a tie on an optimistic score alone
+            const auto tieBreakWeight = [&](uint32_t i) -> int64_t
+            {
+                return mThreadData[i]->pvLines.front().moves.size() > 2 ? threadWeight(i) : 0;
+            };
+
+            voteTable.reserve(param.numThreads);
+
+            for (uint32_t i = 0; i < param.numThreads; ++i)
+            {
+                const PackedMove move = mThreadData[i]->pvLines.front().moves.front();
+                const auto iter = std::find_if(voteTable.begin(), voteTable.end(), [move](const MoveVotes& entry) { return entry.move == move; });
+
+                if (iter != voteTable.end())
+                    iter->votes += threadWeight(i);
+                else
+                    voteTable.push_back({ move, threadWeight(i) });
+            }
+
+            for (uint32_t i = 1; i < param.numThreads; ++i)
+            {
+                const ScoreType score = mThreadData[i]->pvLines.front().score;
+                const ScoreType bestScore = mThreadData[bestThreadIndex]->pvLines.front().score;
+
+                if (IsMate(bestScore) && bestScore > 0)
+                {
+                    // forced win already found, only a faster mate can replace it
+                    if (IsMate(score) && score > bestScore)
+                        bestThreadIndex = i;
+                }
+                else if (IsMate(score) && score > 0)
+                {
+                    // forced win, take it without voting
+                    bestThreadIndex = i;
+                }
+                else if (IsMate(bestScore))
+                {
+                    // selected thread is getting mated, anything scoring higher is better
+                    if (score > bestScore)
+                        bestThreadIndex = i;
+                }
+                else if (!IsMate(score) &&
+                         ((votesOf(i) > votesOf(bestThreadIndex)) ||
+                          (votesOf(i) == votesOf(bestThreadIndex) && tieBreakWeight(i) > tieBreakWeight(bestThreadIndex))))
+                {
+                    bestThreadIndex = i;
+                }
+            }
+
+#ifndef CONFIGURATION_FINAL
+            // debug logging
             for (uint32_t i = 0; i < param.numThreads; ++i)
             {
                 const ThreadData* threadData = mThreadData[i];
                 const PvLine& pvLine = threadData->pvLines.front();
                 std::cout << "info string thread " << i
                     << " completed depth " << threadData->depthCompleted
-                    << " move " << pvLine.moves.front().ToString() << " score " << pvLine.score;
+                    << " move " << pvLine.moves.front().ToString() << " score " << pvLine.score
+                    << " votes " << votesOf(i);
                 if (i == bestThreadIndex) std::cout << " (selected)";
                 std::cout << std::endl;
             }
-        }
 #endif // CONFIGURATION_FINAL
+        }
+
+        // make sure the last reported PV matches the move that is about to be played
+        if (bestThreadIndex != 0 && param.debugLog)
+        {
+            SearchContext searchContext{ game, param, globalStats };
+            const TimePoint searchTime = TimePoint::GetCurrent() - param.limits.startTimePoint;
+
+            for (uint32_t pvIndex = 0; pvIndex < numPvLines; ++pvIndex)
+            {
+                const AspirationWindowSearchParam reportParam =
+                {
+                    game.GetPosition(),
+                    param,
+                    mThreadData[bestThreadIndex]->depthCompleted,
+                    pvIndex,
+                    searchContext,
+                    0,
+                    bestThreadIndex,
+                };
+                ReportPV(reportParam, mThreadData[bestThreadIndex]->pvLines[pvIndex], BoundsType::Exact, searchTime);
+            }
+        }
 
         outResult = std::move(mThreadData[bestThreadIndex]->pvLines);
     }
@@ -984,23 +1073,6 @@ INLINE static bool OppCanWinMaterial(const Position& position, const Threats& th
         (threats.attackedByPawns & (us.queens | us.rooks | us.bishops | us.knights));
 }
 
-ScoreType Search::GetEvalCorrection(const CorrectionHistories* corrHist, const NodeInfo& node) const
-{
-    const Color stm = node.position.GetSideToMove();
-
-    int32_t corr = 0;
-    corr += EvalCorrectionPawnsScale * corrHist->pawnStructure[stm][node.position.GetPawnsHash() % PawnCorrTableSize];
-    corr += EvalCorrectionNonPawnsScale * corrHist->nonPawnWhite[stm][node.position.GetNonPawnsHash(White) % NonPawnCorrTableSize];
-    corr += EvalCorrectionNonPawnsScale * corrHist->nonPawnBlack[stm][node.position.GetNonPawnsHash(Black) % NonPawnCorrTableSize];
-
-    if (node.ply >= 2 && node.previousMove.IsValid() && (&node - 1)->previousMove.IsValid())
-        corr += ContCorrectionScale * corrHist->continuation[stm][node.previousMove.PieceTo()][(&node - 1)->previousMove.PieceTo()];
-    if (node.ply >= 4 && node.previousMove.IsValid() && (&node - 3)->previousMove.IsValid())
-        corr += ContCorrectionScale * corrHist->continuation[stm][node.previousMove.PieceTo()][(&node - 3)->previousMove.PieceTo()];
-
-    return static_cast<ScoreType>(corr / EvalCorrectionScale);
-}
-
 INLINE static void AddToCorrHist(int16_t& history, int32_t value)
 {
     history = static_cast<int16_t>(history + value - history * std::abs(value) / CorrHistGravity);
@@ -1010,8 +1082,23 @@ ScoreType Search::AdjustEvalScore(const ThreadData& thread, const NodeInfo& node
 {
     int32_t adjustedScore = node.staticEval;
     
-    // apply eval correction term
-    adjustedScore += GetEvalCorrection(thread.correctionHistories, node);
+    // apply eval correction
+    {
+        const Color stm = node.position.GetSideToMove();
+        const CorrectionHistories* corrHist = thread.correctionHistories;
+
+        int32_t corr = 0;
+        corr += EvalCorrectionPawnsScale * corrHist->pawnStructure[stm][node.position.GetPawnsHash() % PawnCorrTableSize];
+        corr += EvalCorrectionNonPawnsScale * corrHist->nonPawnWhite[stm][node.position.GetNonPawnsHash(White) % NonPawnCorrTableSize];
+        corr += EvalCorrectionNonPawnsScale * corrHist->nonPawnBlack[stm][node.position.GetNonPawnsHash(Black) % NonPawnCorrTableSize];
+
+        if (node.ply >= 2 && node.previousMove.IsValid() && (&node - 1)->previousMove.IsValid())
+            corr += ContCorrectionScale * corrHist->continuation[stm][node.previousMove.PieceTo()][(&node - 1)->previousMove.PieceTo()];
+        if (node.ply >= 4 && node.previousMove.IsValid() && (&node - 3)->previousMove.IsValid())
+            corr += ContCorrectionScale * corrHist->continuation[stm][node.previousMove.PieceTo()][(&node - 3)->previousMove.PieceTo()];
+
+        adjustedScore += corr / EvalCorrectionScale;
+    }
 
     // scale down when approaching 50-move draw
     adjustedScore = adjustedScore * (FiftyMoveRuleEvalScale - std::max(0, (int32_t)node.position.GetHalfMoveCount())) / FiftyMoveRuleEvalScale;
@@ -1087,9 +1174,12 @@ ScoreType Search::QuiescenceNegaMax(ThreadData& thread, NodeInfo* node, SearchCo
         // don't prune in PV nodes, because TT does not contain path information
         if constexpr (!isPvNode)
         {
-            if (ttEntry.bounds == TTEntry::Bounds::Exact)                           return ttScore;
-            else if (ttEntry.bounds == TTEntry::Bounds::Upper && ttScore <= alpha)  return ttScore;
-            else if (ttEntry.bounds == TTEntry::Bounds::Lower && ttScore >= beta)   return ttScore;
+            if (position.GetHalfMoveCount() < TTCutoffHalfMoveLimit)
+            {
+                if (ttEntry.bounds == TTEntry::Bounds::Exact)                           return ttScore;
+                else if (ttEntry.bounds == TTEntry::Bounds::Upper && ttScore <= alpha)  return ttScore;
+                else if (ttEntry.bounds == TTEntry::Bounds::Lower && ttScore >= beta)   return ttScore;
+            }
         }
     }
 
@@ -1389,12 +1479,10 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
     {
         // Check for draw
         // Skip root node as we need some move to be reported in PV
-        if (node->position.IsFiftyMoveRuleDraw() ||
-            CheckInsufficientMaterial(node->position) ||
-            SearchUtils::IsRepetition(*node, ctx.game, isPvNode))
-        {
+        if (node->previousMove.IsCapture() && CheckInsufficientMaterial(node->position)) [[unlikely]]
             return 0;
-        }
+        if (node->position.IsFiftyMoveRuleDraw() || SearchUtils::IsRepetition(*node, ctx.game, isPvNode))
+            return 0;
 
         // mate distance pruning
         alpha = std::max<ScoreType>(-CheckmateValue + (ScoreType)node->ply, alpha);
@@ -1409,7 +1497,7 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
     const ScoreType oldAlpha = node->alpha;
     ScoreType bestValue = -InfValue;
     ScoreType eval = InvalidValue; // fully adjusted eval
-    ScoreType unadjustedEval = InvalidValue; // eval before TT adjustment
+    ScoreType correctedEval = InvalidValue; // eval after correction but before TT adjustment
     ScoreType tbMinValue = -InfValue; // min value according to tablebases
     ScoreType tbMaxValue = InfValue; // max value according to tablebases
 
@@ -1503,7 +1591,7 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
     // evaluate position
     if (node->isInCheck)
     {
-        unadjustedEval = eval = node->staticEval = InvalidValue;
+        correctedEval = eval = node->staticEval = InvalidValue;
 
         if ((isPvNode || !node->isCutNode) && node->depth > EnsureAccumulatorUpdatedDepth)
         {
@@ -1528,7 +1616,7 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
         ASSERT(node->staticEval != InvalidValue);
 
         // adjust static eval based on node path
-        unadjustedEval = eval = AdjustEvalScore(thread, *node, ctx.searchParam);
+        correctedEval = eval = AdjustEvalScore(thread, *node, ctx.searchParam);
 
         if (!node->filteredMove.IsValid())
         {
@@ -1568,6 +1656,9 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
             isImproving = node->staticEval > (node - 4)->staticEval;
     }
 
+    // the counter two plies ahead is stale by now, the node about to be searched owns it
+    (node + 2)->cutoffCount = 0;
+
     if constexpr (!isPvNode)
     {
         if (!node->filteredMove.IsValid() && !node->isInCheck)
@@ -1597,8 +1688,13 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
             }
 
             // Null Move Pruning
+            // few cutoffs at the next ply means it is not an "easy" node, so be more willing to try the null move
+            const int32_t nmpEvalMargin =
+                (node->depth < NmpDepthTreshold ? NmpEvalTreshold : 0)
+                - ((node + 1)->cutoffCount < NmpCutoffCountMin ? NmpCutoffCountBonus : 0);
+
             if (node->isCutNode &&
-                eval >= beta + (node->depth < NmpDepthTreshold ? NmpEvalTreshold : 0) &&
+                eval >= beta + nmpEvalMargin &&
                 node->staticEval >= beta &&
                 node->depth >= NmpStartDepth &&
                 position.HasNonPawnMaterial(position.GetSideToMove()))
@@ -1785,7 +1881,7 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
                 // skip quiet move that have low chance to beat alpha
                 if (!node->isInCheck &&
                     node->depth < FutilityPruningDepth &&
-                    node->staticEval + FutilityPruningScale * lmrDepth * lmrDepth + moveStatScore / FutilityPruningStatscoreDiv < alpha)
+                    correctedEval + FutilityPruningScale * lmrDepth * lmrDepth + moveStatScore / FutilityPruningStatscoreDiv < alpha)
                 {
                     movePicker.SkipQuiets();
                     if (quietMoveIndex > 1) continue;
@@ -2068,6 +2164,8 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
                 ASSERT(moveIndex > 0);
                 ASSERT(moveIndex <= MoveList::MaxMoves);
 
+                node->cutoffCount++;
+
 #ifdef COLLECT_SEARCH_STATS
                 ctx.stats.totalBetaCutoffs++;
                 ctx.stats.betaCutoffHistogram[moveIndex - 1]++;
@@ -2181,10 +2279,10 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
         // update correction histories
         if (!node->isInCheck &&
             (!bestMove.IsValid() || bestMove.IsQuiet() || !position.StaticExchangeEvaluation(bestMove)) &&
-            ((bestValue < unadjustedEval && bestValue < beta) ||
-             (bestValue > unadjustedEval && bestMove.IsValid())))
+            ((bestValue < correctedEval && bestValue < beta) ||
+             (bestValue > correctedEval && bestMove.IsValid())))
         {
-            const int32_t bonus = std::clamp<int32_t>((bestValue - unadjustedEval) * node->depth / CorrHistBonusDiv, -CorrHistMaxBonus, CorrHistMaxBonus);
+            const int32_t bonus = std::clamp<int32_t>((bestValue - correctedEval) * node->depth / CorrHistBonusDiv, -CorrHistMaxBonus, CorrHistMaxBonus);
             if (bonus != 0)
             {
                 const Color stm = position.GetSideToMove();
