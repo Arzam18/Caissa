@@ -43,7 +43,7 @@ jobs:
           name: caissa-android-arm64
           path: |
             build/bin/caissa
-            build/bin/eval-82-383B.pnn
+            build/bin/eval-ml-5-200B-permuted.pnn
 
       - name: Create prerelease
         uses: softprops/action-gh-release@v2
@@ -53,6 +53,6 @@ jobs:
           prerelease: true
           files: |
             build/bin/caissa
-            build/bin/eval-82-383B.pnn
+            build/bin/eval-ml-5-200B-permuted.pnn
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
