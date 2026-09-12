@@ -97,6 +97,7 @@ DEFINE_PARAM(SingularExtDepthRedSub, 215, 0, 512);
 DEFINE_PARAM(SingularDoubleExtensionMarigin, 14, 5, 25);
 DEFINE_PARAM(SingularTripleExtensionMarigin, 51, 15, 100);
 DEFINE_PARAM(SingularExtTTDepthMargin, 3, 1, 6);
+DEFINE_PARAM(SingularExactBoundMul, 48, 16, 128);
 DEFINE_PARAM(SingularExtPVBonus, 256, 64, 512);
 DEFINE_PARAM(SingularFailHighNegExt, 2, 1, 4);
 DEFINE_PARAM(SingularCutNodeNegExt, 2, 1, 4);
@@ -157,23 +158,6 @@ INLINE static uint32_t GetLateMovePruningTreshold(uint32_t depth, bool improving
 INLINE static int32_t GetHistoryPruningTreshold(int32_t depth)
 {
     return 0 - HistoryPruningLinearFactor * depth - HistoryPruningQuadraticFactor * depth * depth;
-}
-
-void SearchStats::Append(SearchThreadStats& threadStats, bool flush)
-{
-    if (threadStats.nodesTemp >= 128 || flush)
-    {
-        nodes += threadStats.nodesTemp;
-        threadStats.nodesTemp = 0;
-
-        quiescenceNodes += threadStats.quiescenceNodes;
-        threadStats.quiescenceNodes = 0;
-
-        tbHits += threadStats.tbHits;
-        threadStats.tbHits = 0;
-
-        AtomicMax(maxDepth, threadStats.maxDepth);
-    }
 }
 
 Search::Search()
@@ -265,7 +249,7 @@ void Search::Clear()
         ASSERT(threadData);
         threadData->moveOrderer.Clear();
         threadData->nodeCache.Reset();
-        threadData->stats = SearchThreadStats{};
+        threadData->stats.Reset();
     }
 
     for (uint32_t i = 0; i < numa::GetNumNodes(); ++i)
@@ -292,7 +276,32 @@ const NodeCache& Search::GetNodeCache() const
     return mThreadData.front()->nodeCache;
 }
 
-bool Search::CheckStopCondition(const ThreadData& thread, const SearchContext& ctx, bool isRootNode)
+uint64_t Search::GetNodesSearched(uint32_t numThreads) const
+{
+    uint64_t nodes = 0;
+    for (uint32_t i = 0; i < numThreads; ++i)
+    {
+        nodes += mThreadData[i]->stats.nodes;
+    }
+    return nodes;
+}
+
+void Search::CollectStats(SearchStats& outStats, uint32_t numThreads) const
+{
+    outStats.nodes = 0;
+    outStats.tbHits = 0;
+    outStats.maxDepth = 0;
+
+    for (uint32_t i = 0; i < numThreads; ++i)
+    {
+        const SearchThreadStats& stats = mThreadData[i]->stats;
+        outStats.nodes += stats.nodes;
+        outStats.tbHits += stats.tbHits;
+        outStats.maxDepth = std::max<uint32_t>(outStats.maxDepth, stats.maxDepth);
+    }
+}
+
+bool Search::CheckStopCondition(const ThreadData& thread, const SearchContext& ctx, bool isRootNode) const
 {
     SearchParam& param = ctx.searchParam;
 
@@ -303,17 +312,17 @@ bool Search::CheckStopCondition(const ThreadData& thread, const SearchContext& c
 
     if (thread.isMainThread && !param.isPonder.load(std::memory_order_acquire))
     {
-        if (param.limits.maxNodes < UINT64_MAX &&
-            ctx.stats.nodes > param.limits.maxNodes) [[unlikely]]
-        {
-            // nodes limit exceeded
-            param.stopSearch = true;
-            return true;
-        }
-
         // check inner nodes periodically
-        if (isRootNode || (thread.stats.nodesTotal % 512 == 0)) [[unlikely]]
+        if (isRootNode || (thread.stats.nodes % 512 == 0)) [[unlikely]]
         {
+            if (param.limits.maxNodes < UINT64_MAX &&
+                GetNodesSearched(param.numThreads) > param.limits.maxNodes) [[unlikely]]
+            {
+                // nodes limit exceeded
+                param.stopSearch = true;
+                return true;
+            }
+
             if (param.limits.maxTime.IsValid() &&
                 param.limits.startTimePoint.IsValid() &&
                 TimePoint::GetCurrent() >= param.limits.startTimePoint + param.limits.maxTime) [[unlikely]]
@@ -363,7 +372,7 @@ void Search::DoSearch(const Game& game, SearchParam& param, SearchResult& outRes
         return;
     }
 
-    if (!param.limits.analysisMode)
+    if (!param.limits.isInfinite)
     {
         // if we have time limit and there's only a single legal move, return it immediately without evaluation
         if (param.limits.maxTime.IsValid() && numLegalMoves == 1)
@@ -403,6 +412,9 @@ void Search::DoSearch(const Game& game, SearchParam& param, SearchResult& outRes
 
     SearchStats globalStats;
 
+    // reset counters before workers start so the node sum never includes a previous search
+    mThreadData.front()->stats.Reset();
+
     // kick off worker threads
     for (uint32_t i = 1; i < param.numThreads; ++i)
     {
@@ -419,6 +431,7 @@ void Search::DoSearch(const Game& game, SearchParam& param, SearchResult& outRes
         }
 
         ThreadData* threadData = mThreadData[i];
+        threadData->stats.Reset();
         {
             std::unique_lock<std::mutex> lock(threadData->newTaskMutex);
             ASSERT(!threadData->callback);
@@ -580,6 +593,7 @@ void Search::DoSearch(const Game& game, SearchParam& param, SearchResult& outRes
 
     if (outStats)
     {
+        CollectStats(globalStats, param.numThreads);
         *outStats = globalStats;
     }
 
@@ -624,19 +638,19 @@ void Search::ReportPV(const AspirationWindowSearchParam& param, const PvLine& pv
     const float timeInSeconds = searchTime.ToSeconds();
 
     // don't report PV line if very small amount of time passed and we have time limits
-    if (timeInSeconds < PvLineReportDelay &&
-        param.searchParam.limits.maxTime.IsValid() &&
-        !param.searchParam.limits.analysisMode)
+    if (timeInSeconds < PvLineReportDelay && param.searchParam.limits.maxTime.IsValid())
     {
         return;
     }
 
     std::stringstream ss{ std::ios_base::out };
 
-    const uint64_t numNodes = param.searchContext.stats.nodes.load();
+    SearchStats searchStats;
+    CollectStats(searchStats, param.searchParam.numThreads);
+    const uint64_t numNodes = searchStats.nodes;
 
     ss << "info depth " << param.depth;
-    ss << " seldepth " << (uint32_t)param.searchContext.stats.maxDepth;
+    ss << " seldepth " << searchStats.maxDepth;
     if (param.searchParam.numPvLines > 1) ss << " multipv " << (param.pvIndex + 1);
 
     if (pvLine.score > CheckmateValue - (int32_t)MaxSearchDepth)        ss << " score mate " << (CheckmateValue - pvLine.score + 1) / 2;
@@ -661,7 +675,7 @@ void Search::ReportPV(const AspirationWindowSearchParam& param, const PvLine& pv
     ss << " nodes " << numNodes;
     if (timeInSeconds > 0.01f && numNodes > 100) ss << " nps " << (int64_t)((double)numNodes / (double)timeInSeconds);
     ss << " hashfull " << param.searchParam.transpositionTable.GetHashFull();
-    if (param.searchContext.stats.tbHits) ss << " tbhits " << param.searchContext.stats.tbHits;
+    if (searchStats.tbHits) ss << " tbhits " << searchStats.tbHits;
     ss << " time " << static_cast<int64_t>(0.5f + 1000.0f * timeInSeconds);
 
     ss << " pv ";
@@ -749,7 +763,6 @@ void Search::Search_Internal(const uint32_t threadID, const uint32_t numPvLines,
     ThreadData& thread = *(mThreadData[threadID]);
 
     // clear per-thread data for new search
-    thread.stats = SearchThreadStats{};
     thread.depthCompleted = 0;
     thread.pvLines.clear();
     thread.pvLines.resize(numPvLines);
@@ -859,7 +872,7 @@ void Search::Search_Internal(const uint32_t threadID, const uint32_t numPvLines,
         const Move primaryMove = !tempResult.front().moves.empty() ? tempResult.front().moves.front() : Move::Invalid();
 
         // update time manager
-        if (isMainThread && !param.limits.analysisMode)
+        if (isMainThread)
         {
             TimeManagerUpdateData data{ depth, tempResult, thread.pvLines };
 
@@ -899,14 +912,14 @@ void Search::Search_Internal(const uint32_t threadID, const uint32_t numPvLines,
 
             // check soft node limit
             if (param.limits.maxNodesSoft < UINT64_MAX &&
-                searchContext.stats.nodes > param.limits.maxNodesSoft)
+                GetNodesSearched(param.numThreads) > param.limits.maxNodesSoft)
             {
                 param.stopSearch = true;
                 break;
             }
 
             // stop the search if found mate in multiple depths in a row
-            if (!param.limits.analysisMode &&
+            if (!param.limits.isInfinite &&
                 mateCounter >= MateCountStopCondition &&
                 param.limits.maxDepth == UINT16_MAX)
             {
@@ -978,7 +991,7 @@ PvLine Search::AspirationWindowSearch(ThreadData& thread, const AspirationWindow
     PvLine pvLine; // working copy
     PvLine finalPvLine;
 
-    const uint32_t maxPvLine = param.searchParam.limits.analysisMode ? UINT32_MAX : std::min(param.depth, DefaultMaxPvLineLength);
+    const uint32_t maxPvLine = param.searchParam.limits.isInfinite ? UINT32_MAX : std::min(param.depth, DefaultMaxPvLineLength);
 
     // TODO root node could be created in Search_Internal
     NodeInfo& rootNode = thread.searchStack[0];
@@ -1000,9 +1013,6 @@ PvLine Search::AspirationWindowSearch(ThreadData& thread, const AspirationWindow
         pvLine.score = NegaMax<NodeType::Root>(thread, &rootNode, param.searchContext);
         ASSERT(pvLine.score >= -CheckmateValue && pvLine.score <= CheckmateValue);
         SearchUtils::GetPvLine(rootNode, maxPvLine, pvLine.moves);
-
-        // flush pending per-thread stats
-        param.searchContext.stats.Append(thread.stats, true);
 
         BoundsType boundsType = BoundsType::Exact;
 
@@ -1128,9 +1138,7 @@ ScoreType Search::QuiescenceNegaMax(ThreadData& thread, NodeInfo* node, SearchCo
     node->pvLength = 0;
 
     // update stats
-    thread.stats.quiescenceNodes++;
     thread.stats.OnNodeEnter(node->ply + 1);
-    ctx.stats.Append(thread.stats);
 
     ScoreType alpha = node->alpha;
     ScoreType beta = node->beta;
@@ -1321,14 +1329,6 @@ ScoreType Search::QuiescenceNegaMax(ThreadData& thread, NodeInfo* node, SearchCo
                 alpha = score;
                 bestMove = move;
 
-                // update PV line
-                if constexpr (isPvNode)
-                {
-                    node->pvLength = std::min<uint16_t>(1u + childNode.pvLength, MaxSearchDepth);
-                    node->pvLine[0] = move;
-                    memcpy(node->pvLine + 1, childNode.pvLine, sizeof(PackedMove) * std::min<uint16_t>(childNode.pvLength, MaxSearchDepth - 1));
-                }
-
                 if (score >= beta)
                 {
                     if (bestMove.IsCapture())
@@ -1454,7 +1454,6 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
 
     // update stats
     thread.stats.OnNodeEnter(node->ply + 1);
-    ctx.stats.Append(thread.stats);
 
     ScoreType alpha = node->alpha;
     ScoreType beta = node->beta;
@@ -1918,7 +1917,11 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
                 ((ttEntry.bounds & TTEntry::Bounds::Lower) != TTEntry::Bounds::Invalid) &&
                 ttEntry.depth >= node->depth - SingularExtTTDepthMargin)
             {
-                const ScoreType singularBeta = (ScoreType)std::max(-CheckmateValue, (int32_t)ttScore - node->depth);
+                // an exact TT score is more reliable, so use a tighter window and prove singularity more readily
+                const int32_t singularMargin = ttEntry.bounds == TTEntry::Bounds::Exact
+                    ? (node->depth * SingularExactBoundMul + 127) / 128
+                    : node->depth;
+                const ScoreType singularBeta = (ScoreType)std::max(-CheckmateValue, (int32_t)ttScore - singularMargin);
                 const int16_t singularDepth = std::max<int16_t>(1, static_cast<int16_t>(SingularExtDepthRedMul * node->depth - SingularExtDepthRedSub) / 128);
 
                 const bool originalIsCutNode = node->isCutNode;
@@ -1979,7 +1982,8 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
             Prefetch(&corrHist->pawnStructure[stm][childNode.position.GetPawnsHash() % PawnCorrTableSize]);
             Prefetch(&corrHist->nonPawnWhite[stm][childNode.position.GetNonPawnsHash(White) % NonPawnCorrTableSize]);
             Prefetch(&corrHist->nonPawnBlack[stm][childNode.position.GetNonPawnsHash(Black) % NonPawnCorrTableSize]);
-            Prefetch(&corrHist->continuation[stm][move.PieceTo()][node->previousMove.PieceTo()]);
+            if (node->previousMove.IsValid())
+                Prefetch(&corrHist->continuation[stm][move.PieceTo()][node->previousMove.PieceTo()]);
         }
 
         childNode.staticEval = InvalidValue;
@@ -1988,7 +1992,7 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
         childNode.previousMove = move;
         childNode.moveStatScore = moveStatScore;
 
-        const uint64_t nodesSearchedBefore = thread.stats.nodesTotal;
+        const uint64_t nodesSearchedBefore = thread.stats.nodes;
 
         // Late Move Reductions
         int32_t r = 0;
@@ -2119,8 +2123,8 @@ ScoreType Search::NegaMax(ThreadData& thread, NodeInfo* node, SearchContext& ctx
         // update node cache after searching a move
         if (nodeCacheEntry) [[unlikely]]
         {
-            ASSERT(thread.stats.nodesTotal > nodesSearchedBefore);
-            const uint64_t nodesSearched = thread.stats.nodesTotal - nodesSearchedBefore;
+            ASSERT(thread.stats.nodes > nodesSearchedBefore);
+            const uint64_t nodesSearched = thread.stats.nodes - nodesSearchedBefore;
             nodeCacheEntry->AddMoveStats(move, nodesSearched);
         }
 

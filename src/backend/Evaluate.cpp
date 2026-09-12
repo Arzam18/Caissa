@@ -17,7 +17,7 @@
 #else // !defined(CAISSA_EVALFILE)
 
     // use eval file
-    const char* c_DefaultEvalFile = "eval-82-383B.pnn";
+    const char* c_DefaultEvalFile = "eval-ml-5-200B-permuted.pnn";
 
 #endif // defined(CAISSA_EVALFILE)
 
@@ -43,7 +43,14 @@ bool LoadMainNeuralNetwork(const char* path)
     if (path == nullptr || strcmp(path, "") == 0 || strcmp(path, "<empty>") == 0)
     {
 #if defined(CAISSA_EVALFILE)
-        g_mainNeuralNetwork = reinterpret_cast<const nn::PackedNeuralNetwork*>(EmbedData);
+        const auto* embeddedNetwork = reinterpret_cast<const nn::PackedNeuralNetwork*>(EmbedData);
+        // the embedded data is read-only, so an older format cannot be converted in place
+        if (embeddedNetwork->header.version != nn::CurrentVersion)
+        {
+            std::cout << "info string Embedded neural network has unsupported version " << embeddedNetwork->header.version << std::endl;
+            return false;
+        }
+        g_mainNeuralNetwork = embeddedNetwork;
         g_usingEmbeddedNeuralNetwork = true;
         std::cout << "info string Using embedded neural network" << std::endl;
         return true;

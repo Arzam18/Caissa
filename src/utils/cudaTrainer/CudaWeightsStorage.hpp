@@ -12,13 +12,18 @@ public:
     CudaWeightsStorage(uint32_t inputSize, uint32_t outputSize, uint32_t numVariants);
     ~CudaWeightsStorage();
 
-    void Init(uint32_t numActiveInputs, float bias = 0.0f);
+    // Random init: zero-mean normal weights with the given standard deviation, constant biases
+    void Init(uint32_t seed, float stdev, float bias = 0.0f);
 
     // Copy weights from host WeightsStorage
     void CopyFromHost(const nn::WeightsStorage& hostWeights);
 
     // Copy weights to host WeightsStorage
     void CopyToHost(nn::WeightsStorage& hostWeights) const;
+
+    // Full optimizer state (weights plus both Adam moments), for checkpointing
+    void CopyStateToHost(std::vector<float>& outWeights, std::vector<float>& outMoment1, std::vector<float>& outMoment2) const;
+    void CopyStateFromHost(const std::vector<float>& weights, const std::vector<float>& moment1, const std::vector<float>& moment2);
 
     // Update weights using gradients
     void UpdateAdam(const float* gradients, float learningRate, cudaStream_t stream);
@@ -30,6 +35,10 @@ public:
 
     float m_weightsRange = 10.0f;
     float m_biasRange = 10.0f;
+
+    // Weights at index >= m_factorizerFirstWeight (excluding biases) are clamped to m_factorizerRange
+    uint32_t m_factorizerFirstWeight = UINT32_MAX;
+    float m_factorizerRange = 0.0f;
 
     // AdamW decoupled weight decay (applied to weights only, never biases).
     float m_weightDecay = 0.0f;

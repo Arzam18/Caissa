@@ -1,13 +1,13 @@
 #pragma once
 
 #include "Common.hpp"
-#include "net/Network.hpp"
 #include "GameCollection.hpp"
 
 #include "../backend/Position.hpp"
 #include "../backend/PositionUtils.hpp"
 
 #include <array>
+#include <memory>
 
 struct PositionEntry
 {

@@ -28,31 +28,32 @@ void CudaWeightsStorage::AllocateBuffers()
     m_moment2.Allocate(m_totalWeights);
 }
 
-void CudaWeightsStorage::Init(uint32_t numActiveInputs, float bias)
+void CudaWeightsStorage::Init(uint32_t seed, float stdev, float bias)
 {
     std::vector<float> hostWeights(m_totalWeights, 0.0f);
-    std::vector<float> hostMask(m_totalWeights, 1.0f);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::mt19937 gen(seed);
+    std::normal_distribution<float> dist(0.0f, stdev);
 
     const uint32_t weightsPerVariant = (m_inputSize + 1) * m_outputSize;
 
+    // Initialize weights (excluding biases)
+    for (uint32_t i = 0; i < m_inputSize * m_outputSize; ++i)
+    {
+        const float weightValue = dist(gen);
+        for (uint32_t variant = 0; variant < m_numVariants; ++variant)
+        {
+            hostWeights[variant * weightsPerVariant + i] = weightValue;
+        }
+    }
+
+    // Initialize biases
     for (uint32_t variant = 0; variant < m_numVariants; ++variant)
     {
         const uint32_t variantOffset = variant * weightsPerVariant;
-
-        // Initialize weights (excluding biases)
-        for (uint32_t i = 0; i < m_inputSize * m_outputSize; ++i)
-        {
-            hostWeights[variantOffset + i] = dist(gen) * 0.1f;
-        }
-
-        // Initialize biases
         for (uint32_t i = 0; i < m_outputSize; ++i)
         {
-            hostWeights[variantOffset + m_inputSize * m_outputSize + i] = bias;
+            hostWeights[variant * weightsPerVariant + m_inputSize * m_outputSize + i] = bias;
         }
     }
 
@@ -102,6 +103,24 @@ void CudaWeightsStorage::CopyToHost(nn::WeightsStorage& hostWeights) const
     }
 }
 
+void CudaWeightsStorage::CopyStateToHost(std::vector<float>& outWeights, std::vector<float>& outMoment1, std::vector<float>& outMoment2) const
+{
+    outWeights.resize(m_totalWeights);
+    outMoment1.resize(m_totalWeights);
+    outMoment2.resize(m_totalWeights);
+
+    m_weights.CopyToHost(outWeights.data(), m_totalWeights);
+    m_moment1.CopyToHost(outMoment1.data(), m_totalWeights);
+    m_moment2.CopyToHost(outMoment2.data(), m_totalWeights);
+}
+
+void CudaWeightsStorage::CopyStateFromHost(const std::vector<float>& weights, const std::vector<float>& moment1, const std::vector<float>& moment2)
+{
+    m_weights.CopyFromHost(weights.data(), m_totalWeights);
+    m_moment1.CopyFromHost(moment1.data(), m_totalWeights);
+    m_moment2.CopyFromHost(moment2.data(), m_totalWeights);
+}
+
 // Adam parameters
 constexpr float c_beta1 = 0.9f;
 constexpr float c_beta2 = 0.999f;
@@ -133,6 +152,8 @@ __global__ void AdamUpdateKernel(
     float weightDecay,
     float maxWeightRange,
     float maxBiasRange,
+    uint32_t factorizerFirstWeight,
+    float maxFactorizerRange,
     float biasCorrection1, // 1 / (1 - beta1^t), precomputed on the host
     float biasCorrection2  // 1 / (1 - beta2^t), precomputed on the host
 )
@@ -141,7 +162,7 @@ __global__ void AdamUpdateKernel(
     if (idx >= numWeights) return;
 
     const bool isBias = IsBiasIndex(idx, inputSize, outputSize);
-    const float maxWeightValue = isBias ? maxBiasRange : maxWeightRange;
+    const float maxWeightValue = isBias ? maxBiasRange : (idx >= factorizerFirstWeight ? maxFactorizerRange : maxWeightRange);
 
     const float grad = static_cast<float>(gradients[idx]);
 
@@ -196,6 +217,8 @@ void CudaWeightsStorage::UpdateAdam(const float* gradients, float learningRate, 
         m_weightDecay,
         m_weightsRange,
         m_biasRange,
+        m_factorizerFirstWeight,
+        m_factorizerRange,
         biasCorrection1,
         biasCorrection2
     );

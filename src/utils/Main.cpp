@@ -16,14 +16,13 @@ extern void DumpGames(const std::vector<std::string>& args);
 extern void PgnToTrainingData(const std::vector<std::string>& args);
 extern void GenerateEndgamePositions();
 extern void GenerateRandomPositions(const std::vector<std::string>& args);
-extern bool TestNetwork();
-extern bool TrainNetwork();
 extern void ValidateEndgame();
 extern void AnalyzeGames();
 extern void FindMagics();
+extern bool PermuteNet(const std::vector<std::string>& args);
 
 #ifdef USE_CUDA
-extern bool TrainCudaNetwork();
+extern bool TrainCudaNetwork(const std::vector<std::string>& args);
 #endif // USE_CUDA
 
 
@@ -78,19 +77,17 @@ int main(int argc, const char* argv[])
         DumpGames(args);
     else if (toolName == "pgnToTrainingData")
         PgnToTrainingData(args);
-    else if (toolName == "testNetwork")
-        TestNetwork();
     else if (toolName == "validateEndgame")
         ValidateEndgame();
     else if (toolName == "analyzeGames")
         AnalyzeGames();
-    else if (toolName == "trainNetwork")
-        TrainNetwork();
     else if (toolName == "findMagics")
         FindMagics();
+    else if (toolName == "permuteNet")
+        PermuteNet(args);
 #ifdef USE_CUDA
     else if (toolName == "trainCudaNetwork")
-        TrainCudaNetwork();
+        TrainCudaNetwork(args);
 #endif // USE_CUDA
     else if (toolName == "generateEndgamePositions")
         GenerateEndgamePositions();

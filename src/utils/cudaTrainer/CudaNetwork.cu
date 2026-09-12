@@ -1,9 +1,49 @@
 #include "CudaNetwork.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <iostream>
 
 namespace nn {
 namespace cuda {
+
+namespace {
+
+constexpr uint32_t c_checkpointMagic = 'CCKP';
+constexpr uint32_t c_checkpointVersion = 1;
+
+struct CheckpointHeader
+{
+    uint32_t magic;
+    uint32_t version;
+    uint32_t numLayers;
+    uint32_t padding;
+    uint64_t numTrainingVectorsPassed;
+};
+
+// Repeated per layer, so a checkpoint written for a different architecture is rejected instead of
+// being read as garbage.
+struct CheckpointLayerHeader
+{
+    uint32_t inputSize;
+    uint32_t outputSize;
+    uint32_t numVariants;
+    uint32_t padding;
+    uint64_t adamStep;
+};
+
+} // namespace
+
+
+// Number of slices the batch is split into when reducing dense weight gradients. Each slice is a
+// separate block, so the reduction has enough parallelism for the small output subnet layers.
+static constexpr uint32_t c_l1GradientBatchSplits = 16;
+static constexpr uint32_t c_l2GradientBatchSplits = 64;
+static constexpr uint32_t c_l3GradientBatchSplits = 256;
+
+// Threads per block of L1ForwardKernel: one warp per L1 output.
+static constexpr uint32_t c_l1ForwardBlockSize = 32 * nn::L1Size;
 
 // Activation functions
 __device__ __forceinline__ float Sigmoid(float x)
@@ -20,15 +60,15 @@ __device__ __forceinline__ float Sigmoid(float x)
     }
 }
 
-__device__ __forceinline__ float SCReLU(float x)
+__device__ __forceinline__ float CReLU(float x)
 {
-    const float y = fminf(1.0f, fmaxf(0.0f, x));
-    return y * y;
+    return fminf(1.0f, fmaxf(0.0f, x));
 }
 
-__device__ __forceinline__ float SCReLUDerivative(float x)
+// Gate for backpropagating through CReLU, evaluated on the post-activation value.
+__device__ __forceinline__ float CReLUGate(float activated)
 {
-    return (x > 0.0f && x < 1.0f) ? (2.0f * x) : 0.0f;
+    return (activated > 0.0f && activated < 1.0f) ? 1.0f : 0.0f;
 }
 
 // Quantization-aware training: fake-quantize a weight/bias on read, matching the round-to-grid
@@ -46,6 +86,10 @@ CudaNeuralNetwork::CudaNeuralNetwork()
     CUDA_CHECK(cudaEventCreateWithFlags(&m_trainConsumedEvent, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&m_copyDoneEvent, cudaEventDisableTiming));
 
+    // Unlike the synchronization-only events above, these must keep timing enabled.
+    CUDA_CHECK(cudaEventCreate(&m_iterationStartEvent));
+    CUDA_CHECK(cudaEventCreate(&m_iterationEndEvent));
+
     // Pre-record so the first iteration's cross-stream waits are already satisfied.
     CUDA_CHECK(cudaEventRecord(m_ftGradConsumedEvent, m_stream.Get()));
     CUDA_CHECK(cudaEventRecord(m_ftGradClearedEvent, m_auxStream.Get()));
@@ -59,51 +103,216 @@ CudaNeuralNetwork::~CudaNeuralNetwork()
     cudaEventDestroy(m_ftGradClearedEvent);
     cudaEventDestroy(m_trainConsumedEvent);
     cudaEventDestroy(m_copyDoneEvent);
+    cudaEventDestroy(m_iterationStartEvent);
+    cudaEventDestroy(m_iterationEndEvent);
 }
 
-void CudaNeuralNetwork::Init(const nn::WeightsStoragePtr& featureTransformerWeights, const nn::WeightsStoragePtr& lastLayerWeights)
+void CudaNeuralNetwork::BeginIterationTiming()
+{
+    CUDA_CHECK(cudaEventRecord(m_iterationStartEvent, m_stream.Get()));
+}
+
+float CudaNeuralNetwork::EndIterationTimingMs()
+{
+    CUDA_CHECK(cudaEventRecord(m_iterationEndEvent, m_stream.Get()));
+    CUDA_CHECK(cudaEventSynchronize(m_iterationEndEvent));
+
+    float elapsedMs = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsedMs, m_iterationStartEvent, m_iterationEndEvent));
+    return elapsedMs;
+}
+
+void CudaNeuralNetwork::InitRandomWeights(uint32_t seed)
+{
+    // scaled so that the accumulator of a ~32 feature position lands in the CReLU range
+    m_featureTransformerWeights->Init(seed, 0.1f);
+
+#if USE_FACTORIZER
+    // the factorizer starts at zero, so the effective weights are just the bucket weights
+    CUDA_CHECK(cudaMemset(
+        m_featureTransformerWeights->m_weights.Get() + c_numNetworkInputs * c_accumulatorSize,
+        0, FactorizerInputs * c_accumulatorSize * sizeof(float)));
+#endif // USE_FACTORIZER
+
+    InitRandomOutputSubnetWeights(seed);
+}
+
+void CudaNeuralNetwork::InitRandomOutputSubnetWeights(uint32_t seed)
+{
+    // He initialization, appropriate for the (clipped) ReLU activations of the output subnet
+    m_l1Weights->Init(seed + 1, sqrtf(2.0f / (float)c_l1InputSize));
+    m_l2Weights->Init(seed + 2, sqrtf(2.0f / (float)c_l1Size));
+    m_l3Weights->Init(seed + 3, sqrtf(2.0f / (float)c_l2Size));
+}
+
+void CudaNeuralNetwork::Init(
+    const nn::WeightsStoragePtr& featureTransformerWeights,
+    const nn::WeightsStoragePtr& l1Weights,
+    const nn::WeightsStoragePtr& l2Weights,
+    const nn::WeightsStoragePtr& l3Weights)
 {
     // Create CUDA weight storages based on host network
     m_featureTransformerWeights = std::make_shared<CudaWeightsStorage>(
-        c_numNetworkInputs, c_accumulatorSize, 1
+        FeatureTransformerInputs, c_accumulatorSize, 1
     );
-    m_featureTransformerWeights->Init(c_numNetworkInputs);
+#if USE_FACTORIZER
+    m_featureTransformerWeights->m_factorizerFirstWeight = c_numNetworkInputs * c_accumulatorSize;
+    m_featureTransformerWeights->m_factorizerRange = FactorizerWeightRange;
+#endif // USE_FACTORIZER
 
-    m_lastLayerWeights = std::make_shared<CudaWeightsStorage>(
-        2 * c_accumulatorSize, 1, c_numVariants
-    );
-    m_lastLayerWeights->Init(2 * c_accumulatorSize);
+    m_l1Weights = std::make_shared<CudaWeightsStorage>(c_l1InputSize, c_l1Size, c_numVariants);
+    m_l2Weights = std::make_shared<CudaWeightsStorage>(c_l1Size, c_l2Size, c_numVariants);
+    m_l3Weights = std::make_shared<CudaWeightsStorage>(c_l2Size, 1, c_numVariants);
 
-    // Copy initial weights from host
-    m_featureTransformerWeights->CopyFromHost(*featureTransformerWeights);
-    m_lastLayerWeights->CopyFromHost(*lastLayerWeights);
-
-    CopyWeightsFromHost(featureTransformerWeights, lastLayerWeights);
+    CopyWeightsFromHost(featureTransformerWeights, l1Weights, l2Weights, l3Weights);
 
     // Quantization-aware training: weights/biases are fake-quantized on read in the forward/backward
     // kernels using the same scales as the final pack step.
     m_featureTransformerWeights->m_weightQuantScale = nn::InputLayerWeightQuantizationScale;
     m_featureTransformerWeights->m_biasQuantScale = nn::InputLayerBiasQuantizationScale;
-    m_lastLayerWeights->m_weightQuantScale = nn::OutputLayerWeightQuantizationScale;
-    m_lastLayerWeights->m_biasQuantScale = nn::OutputLayerBiasQuantizationScale;
+    m_l1Weights->m_weightQuantScale = nn::HiddenLayerWeightQuantizationScale;
+    m_l1Weights->m_biasQuantScale = nn::HiddenLayerBiasQuantizationScale;
+    m_l2Weights->m_weightQuantScale = nn::HiddenLayerWeightQuantizationScale;
+    m_l2Weights->m_biasQuantScale = nn::HiddenLayerBiasQuantizationScale;
+    m_l3Weights->m_weightQuantScale = nn::OutputLayerWeightQuantizationScale;
+    m_l3Weights->m_biasQuantScale = nn::OutputLayerBiasQuantizationScale;
 }
 
-void CudaNeuralNetwork::SetWeightDecay(float featureTransformerDecay, float lastLayerDecay)
+void CudaNeuralNetwork::SetWeightDecay(float featureTransformerDecay, float outputSubnetDecay)
 {
     m_featureTransformerWeights->m_weightDecay = featureTransformerDecay;
-    m_lastLayerWeights->m_weightDecay = lastLayerDecay;
+    m_l1Weights->m_weightDecay = outputSubnetDecay;
+    m_l2Weights->m_weightDecay = outputSubnetDecay;
+    m_l3Weights->m_weightDecay = outputSubnetDecay;
 }
 
-void CudaNeuralNetwork::CopyWeightsFromHost(const nn::WeightsStoragePtr& featureTransformerWeights, const nn::WeightsStoragePtr& lastLayerWeights)
+void CudaNeuralNetwork::CopyWeightsFromHost(
+    const nn::WeightsStoragePtr& featureTransformerWeights,
+    const nn::WeightsStoragePtr& l1Weights,
+    const nn::WeightsStoragePtr& l2Weights,
+    const nn::WeightsStoragePtr& l3Weights)
 {
     m_featureTransformerWeights->CopyFromHost(*featureTransformerWeights);
-    m_lastLayerWeights->CopyFromHost(*lastLayerWeights);
+    m_l1Weights->CopyFromHost(*l1Weights);
+    m_l2Weights->CopyFromHost(*l2Weights);
+    m_l3Weights->CopyFromHost(*l3Weights);
 }
 
-void CudaNeuralNetwork::CopyWeightsToHost(const nn::WeightsStoragePtr& featureTransformerWeights, const nn::WeightsStoragePtr& lastLayerWeights) const
+bool CudaNeuralNetwork::SaveCheckpoint(const char* path, uint64_t numTrainingVectorsPassed) const
+{
+    const CudaWeightsStoragePtr layers[] = { m_featureTransformerWeights, m_l1Weights, m_l2Weights, m_l3Weights };
+
+    FILE* file = fopen(path, "wb");
+    if (!file)
+    {
+        std::cerr << "Failed to save checkpoint: cannot open " << path << std::endl;
+        return false;
+    }
+
+    CheckpointHeader header{};
+    header.magic = c_checkpointMagic;
+    header.version = c_checkpointVersion;
+    header.numLayers = (uint32_t)std::size(layers);
+    header.numTrainingVectorsPassed = numTrainingVectorsPassed;
+
+    bool ok = fwrite(&header, sizeof(header), 1, file) == 1;
+
+    std::vector<float> weights, moment1, moment2;
+    for (const CudaWeightsStoragePtr& layer : layers)
+    {
+        if (!ok) break;
+
+        CheckpointLayerHeader layerHeader{};
+        layerHeader.inputSize = layer->m_inputSize;
+        layerHeader.outputSize = layer->m_outputSize;
+        layerHeader.numVariants = layer->m_numVariants;
+        layerHeader.adamStep = layer->m_adamStep;
+
+        layer->CopyStateToHost(weights, moment1, moment2);
+
+        ok = fwrite(&layerHeader, sizeof(layerHeader), 1, file) == 1
+            && fwrite(weights.data(), sizeof(float), weights.size(), file) == weights.size()
+            && fwrite(moment1.data(), sizeof(float), moment1.size(), file) == moment1.size()
+            && fwrite(moment2.data(), sizeof(float), moment2.size(), file) == moment2.size();
+    }
+
+    fclose(file);
+
+    if (!ok)
+        std::cerr << "Failed to save checkpoint: cannot write " << path << std::endl;
+
+    return ok;
+}
+
+bool CudaNeuralNetwork::LoadCheckpoint(const char* path, uint64_t& outNumTrainingVectorsPassed)
+{
+    const CudaWeightsStoragePtr layers[] = { m_featureTransformerWeights, m_l1Weights, m_l2Weights, m_l3Weights };
+
+    FILE* file = fopen(path, "rb");
+    if (!file)
+    {
+        std::cerr << "Failed to load checkpoint: cannot open " << path << std::endl;
+        return false;
+    }
+
+    CheckpointHeader header{};
+    if (fread(&header, sizeof(header), 1, file) != 1 ||
+        header.magic != c_checkpointMagic ||
+        header.version != c_checkpointVersion ||
+        header.numLayers != (uint32_t)std::size(layers))
+    {
+        fclose(file);
+        std::cerr << "Failed to load checkpoint: " << path << " is not a compatible checkpoint" << std::endl;
+        return false;
+    }
+
+    std::vector<float> weights, moment1, moment2;
+    for (const CudaWeightsStoragePtr& layer : layers)
+    {
+        CheckpointLayerHeader layerHeader{};
+        if (fread(&layerHeader, sizeof(layerHeader), 1, file) != 1 ||
+            layerHeader.inputSize != layer->m_inputSize ||
+            layerHeader.outputSize != layer->m_outputSize ||
+            layerHeader.numVariants != layer->m_numVariants)
+        {
+            fclose(file);
+            std::cerr << "Failed to load checkpoint: " << path << " was written for a different architecture" << std::endl;
+            return false;
+        }
+
+        weights.resize(layer->m_totalWeights);
+        moment1.resize(layer->m_totalWeights);
+        moment2.resize(layer->m_totalWeights);
+
+        const size_t count = layer->m_totalWeights;
+        if (fread(weights.data(), sizeof(float), count, file) != count ||
+            fread(moment1.data(), sizeof(float), count, file) != count ||
+            fread(moment2.data(), sizeof(float), count, file) != count)
+        {
+            fclose(file);
+            std::cerr << "Failed to load checkpoint: " << path << " is truncated" << std::endl;
+            return false;
+        }
+
+        layer->CopyStateFromHost(weights, moment1, moment2);
+        layer->m_adamStep = (size_t)layerHeader.adamStep;
+    }
+
+    fclose(file);
+    outNumTrainingVectorsPassed = header.numTrainingVectorsPassed;
+    return true;
+}
+
+void CudaNeuralNetwork::CopyWeightsToHost(
+    const nn::WeightsStoragePtr& featureTransformerWeights,
+    const nn::WeightsStoragePtr& l1Weights,
+    const nn::WeightsStoragePtr& l2Weights,
+    const nn::WeightsStoragePtr& l3Weights) const
 {
     m_featureTransformerWeights->CopyToHost(*featureTransformerWeights);
-    m_lastLayerWeights->CopyToHost(*lastLayerWeights);
+    m_l1Weights->CopyToHost(*l1Weights);
+    m_l2Weights->CopyToHost(*l2Weights);
+    m_l3Weights->CopyToHost(*l3Weights);
 }
 
 // CUDA kernel for sparse binary input accumulation
@@ -126,6 +335,17 @@ __global__ void SparseBinaryInputKernel(
     // biases are stored right after the weight matrix
     const float bias = FakeQuantize(weights[inputSize * accumulatorSize + accumulatorIdx], biasScale, invBiasScale);
 
+    // Effective weight of a feature: the bucket weight plus the shared factorizer weight,
+    // fake-quantized as a sum because that is what gets packed.
+    const auto featureWeight = [&](uint32_t feature)
+    {
+        float w = weights[feature * accumulatorSize + accumulatorIdx];
+#if USE_FACTORIZER
+        w += weights[(nn::NumNetworkInputs + feature % FactorizerInputs) * accumulatorSize + accumulatorIdx];
+#endif // USE_FACTORIZER
+        return FakeQuantize(w, weightScale, invWeightScale);
+    };
+
     // Process white features
     float whiteSum = bias;
     for (uint32_t i = 0; i < trainingVector->numWhiteFeatures; ++i)
@@ -133,7 +353,7 @@ __global__ void SparseBinaryInputKernel(
         const uint16_t feature = trainingVector->whiteFeatures[i];
         if (feature >= inputSize) continue;
 
-        whiteSum += FakeQuantize(weights[feature * accumulatorSize + accumulatorIdx], weightScale, invWeightScale);
+        whiteSum += featureWeight(feature);
     }
     accumulators[2 * batchIdx * accumulatorSize + accumulatorIdx] = whiteSum;
 
@@ -144,49 +364,129 @@ __global__ void SparseBinaryInputKernel(
         const uint16_t feature = trainingVector->blackFeatures[i];
         if (feature >= inputSize) continue;
 
-        blackSum += FakeQuantize(weights[feature * accumulatorSize + accumulatorIdx], weightScale, invWeightScale);
+        blackSum += featureWeight(feature);
     }
     accumulators[2 * batchIdx * accumulatorSize + accumulatorSize + accumulatorIdx] = blackSum;
 }
 
-// CUDA kernel for fully connected layer (last layer)
-__global__ void FullyConnectedKernel(
+#if USE_FACTORIZER
+// The factorizer weight of a feature is shared by all king buckets, so its gradient is the sum of
+// the bucket gradients of that feature. Computed from the accumulated bucket gradients instead of
+// adding a second atomic per feature to FeatureTransformerGradientsKernel.
+__global__ void FactorizerGradientsKernel(
+    float* __restrict__ weightGradients,
+    uint32_t accumulatorSize
+)
+{
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= FactorizerInputs * accumulatorSize) return;
+
+    float sum = 0.0f;
+    for (uint32_t bucket = 0; bucket < nn::NumKingBuckets; ++bucket)
+        sum += weightGradients[bucket * FactorizerInputs * accumulatorSize + idx];
+
+    weightGradients[nn::NumNetworkInputs * accumulatorSize + idx] = sum;
+}
+#endif // USE_FACTORIZER
+
+// Pairwise activation: the two halves of each accumulator are clipped and multiplied together.
+// The two perspectives are concatenated, side to move first, into L1InputSize values.
+__global__ void PairwiseForwardKernel(
+    const float* __restrict__ accumulators,
+    float* __restrict__ outputs,
+    uint32_t batchSize
+)
+{
+    constexpr uint32_t halfSize = nn::AccumulatorSize / 2;
+
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batchSize * nn::L1InputSize) return;
+
+    const uint32_t batchIdx = idx / nn::L1InputSize;
+    const uint32_t elemIdx = idx % nn::L1InputSize;
+    const uint32_t accumulatorBase =
+        2 * batchIdx * nn::AccumulatorSize + (elemIdx / halfSize) * nn::AccumulatorSize;
+    const uint32_t pairIdx = elemIdx % halfSize;
+
+    outputs[idx] =
+        CReLU(accumulators[accumulatorBase + pairIdx]) *
+        CReLU(accumulators[accumulatorBase + pairIdx + halfSize]);
+}
+
+// L1 forward: one block per batch element. The pairwise activations are staged in shared memory so
+// the block reads them from global memory once. Thread t owns output (t % L1Size) and every
+// (t / L1Size)-th input, which makes its weight index exactly t + k * blockDim - so a warp reads 32
+// consecutive weights instead of striding one output row at a time. Partial dot products are
+// reduced through shared memory.
+__global__ void L1ForwardKernel(
+    const TrainingEntry* __restrict__ trainingVectors,
+    const float* __restrict__ inputs,
+    const float* __restrict__ weights,
+    float* __restrict__ outputs,
+    float weightScale, float biasScale, float invWeightScale, float invBiasScale
+)
+{
+    constexpr uint32_t inputsPerThread = c_l1ForwardBlockSize / nn::L1Size;
+
+    __shared__ float s_input[nn::L1InputSize];
+    __shared__ float s_partial[c_l1ForwardBlockSize];
+
+    const uint32_t batchIdx = blockIdx.x;
+
+    for (uint32_t i = threadIdx.x; i < nn::L1InputSize; i += c_l1ForwardBlockSize)
+        s_input[i] = inputs[batchIdx * nn::L1InputSize + i];
+    __syncthreads();
+
+    const uint32_t variant = trainingVectors[batchIdx].variant;
+    const float* __restrict__ w = weights + variant * (nn::L1InputSize + 1) * nn::L1Size;
+
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < nn::L1InputSize / inputsPerThread; ++k)
+    {
+        const uint32_t i = threadIdx.x / nn::L1Size + k * inputsPerThread;
+        sum += s_input[i] * FakeQuantize(w[threadIdx.x + k * c_l1ForwardBlockSize], weightScale, invWeightScale);
+    }
+
+    s_partial[threadIdx.x] = sum;
+    __syncthreads();
+
+    if (threadIdx.x < nn::L1Size)
+    {
+        float total = 0.0f;
+        for (uint32_t k = 0; k < inputsPerThread; ++k)
+            total += s_partial[threadIdx.x + k * nn::L1Size];
+
+        const float bias = FakeQuantize(w[nn::L1InputSize * nn::L1Size + threadIdx.x], biasScale, invBiasScale);
+        outputs[batchIdx * nn::L1Size + threadIdx.x] = CReLU(total + bias);
+    }
+}
+
+// Forward pass of a narrow dense layer (L2 and the scalar output layer): one thread per
+// (batch element, output).
+template<uint32_t InputSize, uint32_t OutputSize, bool ApplyOutputCReLU>
+__global__ void SmallDenseForwardKernel(
     const TrainingEntry* __restrict__ trainingVectors,
     const float* __restrict__ inputs,
     const float* __restrict__ weights,
     float* __restrict__ outputs,
     uint32_t batchSize,
-    uint32_t inputSize,
     float weightScale, float biasScale, float invWeightScale, float invBiasScale
 )
 {
-    // One warp per batch element: lanes stride the input dimension (coalesced reads),
-    // then a warp reduction combines the partial dot products.
-    const uint32_t batchIdx = (blockIdx.x * blockDim.x + threadIdx.x) / 32u;
-    const uint32_t lane = threadIdx.x & 31u;
-    if (batchIdx >= batchSize) return;
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batchSize * OutputSize) return;
+
+    const uint32_t batchIdx = idx / OutputSize;
+    const uint32_t outputIdx = idx % OutputSize;
 
     const uint32_t variant = trainingVectors[batchIdx].variant;
-    const float* __restrict__ in = inputs + batchIdx * inputSize;
-    const float* __restrict__ w = weights + variant * (inputSize + 1);
+    const float* __restrict__ w = weights + variant * (InputSize + 1) * OutputSize;
 
-    float sum = 0.0f;
-    for (uint32_t i = lane; i < inputSize; i += 32u)
-    {
-        sum += SCReLU(in[i]) * FakeQuantize(w[i], weightScale, invWeightScale);
-    }
+    float sum = FakeQuantize(w[InputSize * OutputSize + outputIdx], biasScale, invBiasScale);
+    for (uint32_t i = 0; i < InputSize; ++i)
+        sum += inputs[batchIdx * InputSize + i] * FakeQuantize(w[i * OutputSize + outputIdx], weightScale, invWeightScale);
 
-    // Warp reduction
-    #pragma unroll
-    for (uint32_t offset = 16u; offset > 0u; offset >>= 1)
-    {
-        sum += __shfl_down_sync(0xFFFFFFFFu, sum, offset);
-    }
-
-    if (lane == 0u)
-    {
-        outputs[batchIdx] = sum + FakeQuantize(w[inputSize], biasScale, invBiasScale); // add bias
-    }
+    outputs[idx] = ApplyOutputCReLU ? CReLU(sum) : sum;
 }
 
 // CUDA kernel for sigmoid activation
@@ -228,7 +528,7 @@ void CudaNeuralNetwork::Forward(CudaBatchData& batch)
             m_featureTransformerWeights->m_weights.Get(),
             batch.accumulatorBuffer.Get(),
             batchSize,
-            c_numNetworkInputs,
+            FeatureTransformerInputs,
             c_accumulatorSize,
             m_featureTransformerWeights->m_weightQuantScale,
             m_featureTransformerWeights->m_biasQuantScale,
@@ -238,22 +538,68 @@ void CudaNeuralNetwork::Forward(CudaBatchData& batch)
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Fully connected layer (last layer)
+    // Pairwise activation of the feature transformer output
     {
         const dim3 blockSize(256);
-        const dim3 gridSize((batchSize * 32 + blockSize.x - 1) / blockSize.x); // one warp per batch element
+        const dim3 gridSize((batchSize * c_l1InputSize + blockSize.x - 1) / blockSize.x);
 
-        FullyConnectedKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
-            batch.trainingVectors.Get(),
+        PairwiseForwardKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
             batch.accumulatorBuffer.Get(),
-            m_lastLayerWeights->m_weights.Get(),
-            batch.hiddenBuffer.Get(),
+            batch.pairwiseBuffer.Get(),
+            batchSize
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // L1
+    {
+        L1ForwardKernel<<<batchSize, c_l1ForwardBlockSize, 0, m_stream.Get()>>>(
+            batch.trainingVectors.Get(),
+            batch.pairwiseBuffer.Get(),
+            m_l1Weights->m_weights.Get(),
+            batch.l1Buffer.Get(),
+            m_l1Weights->m_weightQuantScale,
+            m_l1Weights->m_biasQuantScale,
+            1.0f / m_l1Weights->m_weightQuantScale,
+            1.0f / m_l1Weights->m_biasQuantScale
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // L2
+    {
+        const dim3 blockSize(256);
+        const dim3 gridSize((batchSize * c_l2Size + blockSize.x - 1) / blockSize.x);
+
+        SmallDenseForwardKernel<nn::L1Size, nn::L2Size, true><<<gridSize, blockSize, 0, m_stream.Get()>>>(
+            batch.trainingVectors.Get(),
+            batch.l1Buffer.Get(),
+            m_l2Weights->m_weights.Get(),
+            batch.l2Buffer.Get(),
             batchSize,
-            2 * c_accumulatorSize,
-            m_lastLayerWeights->m_weightQuantScale,
-            m_lastLayerWeights->m_biasQuantScale,
-            1.0f / m_lastLayerWeights->m_weightQuantScale,
-            1.0f / m_lastLayerWeights->m_biasQuantScale
+            m_l2Weights->m_weightQuantScale,
+            m_l2Weights->m_biasQuantScale,
+            1.0f / m_l2Weights->m_weightQuantScale,
+            1.0f / m_l2Weights->m_biasQuantScale
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // L3 (scalar output, no activation)
+    {
+        const dim3 blockSize(256);
+        const dim3 gridSize((batchSize + blockSize.x - 1) / blockSize.x);
+
+        SmallDenseForwardKernel<nn::L2Size, 1, false><<<gridSize, blockSize, 0, m_stream.Get()>>>(
+            batch.trainingVectors.Get(),
+            batch.l2Buffer.Get(),
+            m_l3Weights->m_weights.Get(),
+            batch.l3Buffer.Get(),
+            batchSize,
+            m_l3Weights->m_weightQuantScale,
+            m_l3Weights->m_biasQuantScale,
+            1.0f / m_l3Weights->m_weightQuantScale,
+            1.0f / m_l3Weights->m_biasQuantScale
         );
         CUDA_CHECK(cudaGetLastError());
     }
@@ -264,7 +610,7 @@ void CudaNeuralNetwork::Forward(CudaBatchData& batch)
         const dim3 gridSize((batchSize + blockSize.x - 1) / blockSize.x);
 
         SigmoidActivationKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
-            batch.hiddenBuffer.Get(),
+            batch.l3Buffer.Get(),
             batch.networkOutputs.Get(),
             batchSize
         );
@@ -273,107 +619,216 @@ void CudaNeuralNetwork::Forward(CudaBatchData& batch)
 }
 
 // Backward pass kernels
+static constexpr uint32_t c_sigmoidDerivativeBlockSize = 256;
+
+// Also accumulates the batch's squared-error sum into lossSum (one atomic per block).
 __global__ void SigmoidDerivativeKernel(
     const float* __restrict__ outputs,
     const TrainingEntry* __restrict__ trainingVectors,
     float* __restrict__ outputErrors,
+    float* __restrict__ lossSum,
     uint32_t batchSize
 )
 {
-    const uint32_t batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (batchIdx >= batchSize) return;
+    __shared__ float s_squaredErrors[c_sigmoidDerivativeBlockSize];
 
-    const float output = outputs[batchIdx];
-    const float target = trainingVectors[batchIdx].targetOutput;
-    const float derivative = output * (1.0f - output);
-    outputErrors[batchIdx] = 2.0f * (output - target) * derivative;
+    const uint32_t batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float squaredError = 0.0f;
+    if (batchIdx < batchSize)
+    {
+        const float output = outputs[batchIdx];
+        const float target = trainingVectors[batchIdx].targetOutput;
+        const float derivative = output * (1.0f - output);
+        const float diff = output - target;
+        outputErrors[batchIdx] = 2.0f * diff * derivative;
+        squaredError = diff * diff;
+    }
+
+    s_squaredErrors[threadIdx.x] = squaredError;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2)
+    {
+        if (threadIdx.x < stride)
+            s_squaredErrors[threadIdx.x] += s_squaredErrors[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        atomicAdd(lossSum, s_squaredErrors[0]);
 }
 
-__global__ void LastLayerGradientsKernel(
+// Weight and bias gradients of one dense output-subnet layer, for all variants at once.
+//
+// threadIdx spans (input within a tile, output); blockIdx.x selects the input tile and blockIdx.y
+// a slice of the batch. The slice is walked in tiles staged in shared memory, so the block reads
+// each input and output gradient from global memory once instead of once per thread that needs it.
+// Per-variant partials live in registers - the unrolled compare keeps that array out of local
+// memory. The bias gradient comes for free from the same output-gradient read, and is accumulated
+// only by the first input tile so it is not counted once per tile.
+template<uint32_t OutputSize, uint32_t InputTileSize>
+__global__ void DenseWeightGradientsKernel(
     const TrainingEntry* __restrict__ trainingVectors,
-    const float* __restrict__ accumulatorBuffer,
-    const float* __restrict__ outputErrors,
-    float* __restrict__ weightGradients,
+    const float* __restrict__ activatedInputs, // [batchSize][inputSize]
+    const float* __restrict__ outputGrads,     // [batchSize][OutputSize]
+    float* __restrict__ weightGradients,       // [numVariants][(inputSize + 1) * OutputSize]
     uint32_t batchSize,
-    uint32_t inputSize
-)
+    uint32_t inputSize)
 {
-    // threadIdx.x selects the input (inputSize is the bias slot); threadIdx.y splits the
-    // batch reduction so we read each accumulator value once across all variants instead of
-    // re-scanning the whole batch per variant. Per-variant partials are kept in registers and
-    // combined across threadIdx.y via shared memory.
-    const uint32_t inputIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t numSplits = blockDim.y;
-    const bool active = (inputIdx <= inputSize);
-    const bool isBias = (inputIdx == inputSize);
+    constexpr uint32_t batchTileSize = 32;
+    constexpr uint32_t blockThreads = InputTileSize * OutputSize;
 
-    float gradients[nn::NumVariants];
+    __shared__ float s_inputs[batchTileSize * InputTileSize];
+    __shared__ float s_grads[batchTileSize * OutputSize];
+    __shared__ uint8_t s_variants[batchTileSize];
+
+    const uint32_t inputIdx = blockIdx.x * InputTileSize + threadIdx.x;
+    const uint32_t outputIdx = threadIdx.y;
+    const uint32_t threadIdxFlat = threadIdx.y * InputTileSize + threadIdx.x;
+
+    // The bias does not depend on the input, so only one input tile accumulates it. The condition
+    // is block-uniform, so skipping the work costs no divergence.
+    const bool accumulateBias = (blockIdx.x == 0);
+
+    float weightGrad[nn::NumVariants];
+    float biasGrad[nn::NumVariants];
     #pragma unroll
-    for (uint32_t v = 0; v < nn::NumVariants; ++v) gradients[v] = 0.0f;
+    for (uint32_t v = 0; v < nn::NumVariants; ++v) { weightGrad[v] = 0.0f; biasGrad[v] = 0.0f; }
 
-    if (active)
+    const uint32_t sliceSize = (batchSize + gridDim.y - 1) / gridDim.y;
+    const uint32_t begin = blockIdx.y * sliceSize;
+    const uint32_t end = min(begin + sliceSize, batchSize);
+
+    for (uint32_t base = begin; base < end; base += batchTileSize)
     {
-        for (uint32_t batchIdx = threadIdx.y; batchIdx < batchSize; batchIdx += numSplits)
+        const uint32_t tileCount = min(batchTileSize, end - base);
+
+        __syncthreads();
+        for (uint32_t n = threadIdxFlat; n < tileCount * InputTileSize; n += blockThreads)
+            s_inputs[n] = activatedInputs[(base + n / InputTileSize) * inputSize + blockIdx.x * InputTileSize + n % InputTileSize];
+        for (uint32_t n = threadIdxFlat; n < tileCount * OutputSize; n += blockThreads)
+            s_grads[n] = outputGrads[(base + n / OutputSize) * OutputSize + n % OutputSize];
+        for (uint32_t n = threadIdxFlat; n < tileCount; n += blockThreads)
+            s_variants[n] = trainingVectors[base + n].variant;
+        __syncthreads();
+
+        for (uint32_t b = 0; b < tileCount; ++b)
         {
-            const uint32_t variant = trainingVectors[batchIdx].variant;
-            const float error = outputErrors[batchIdx];
-            const float contribution = isBias ? error
-                : SCReLU(accumulatorBuffer[batchIdx * inputSize + inputIdx]) * error;
+            const uint32_t variant = s_variants[b];
+            const float outputGrad = s_grads[b * OutputSize + outputIdx];
+            const float input = s_inputs[b * InputTileSize + threadIdx.x];
 
             #pragma unroll
             for (uint32_t v = 0; v < nn::NumVariants; ++v)
+                if (variant == v) weightGrad[v] += input * outputGrad;
+
+            if (accumulateBias)
             {
-                if (variant == v) gradients[v] += contribution;
+                #pragma unroll
+                for (uint32_t v = 0; v < nn::NumVariants; ++v)
+                    if (variant == v) biasGrad[v] += outputGrad;
             }
         }
     }
 
-    // Reduce per-variant partials across threadIdx.y. Layout: [blockDim.y][blockDim.x][NumVariants].
-    extern __shared__ float shared[];
-    const uint32_t slot = (threadIdx.y * blockDim.x + threadIdx.x) * nn::NumVariants;
-    #pragma unroll
-    for (uint32_t v = 0; v < nn::NumVariants; ++v) shared[slot + v] = gradients[v];
-    __syncthreads();
+    const uint32_t variantStride = (inputSize + 1) * OutputSize;
 
-    if (threadIdx.y == 0 && active)
+    #pragma unroll
+    for (uint32_t v = 0; v < nn::NumVariants; ++v)
+        atomicAdd(&weightGradients[v * variantStride + inputIdx * OutputSize + outputIdx], weightGrad[v]);
+
+    if (accumulateBias && threadIdx.x == 0)
     {
         #pragma unroll
         for (uint32_t v = 0; v < nn::NumVariants; ++v)
-        {
-            float sum = 0.0f;
-            for (uint32_t s = 0; s < numSplits; ++s)
-            {
-                sum += shared[(s * blockDim.x + threadIdx.x) * nn::NumVariants + v];
-            }
-            weightGradients[v * (inputSize + 1) + inputIdx] = sum;
-        }
+            atomicAdd(&weightGradients[v * variantStride + inputSize * OutputSize + outputIdx], biasGrad[v]);
     }
 }
 
-__global__ void BackpropToCReLUKernel(
+// Backpropagates a dense layer's output gradient to its input's pre-activation, gating by the
+// CReLU that produced the (post-activation) input.
+template<uint32_t InputSize, uint32_t OutputSize>
+__global__ void BackpropToHiddenKernel(
     const TrainingEntry* __restrict__ trainingVectors,
-    const float* __restrict__ outputErrors,
-    const float* __restrict__ creluInputs,
-    float* __restrict__ creluErrors,
-    const float* __restrict__ weights,
+    const float* __restrict__ outputGrads,     // [batchSize][OutputSize]
+    const float* __restrict__ weights,         // [numVariants][(InputSize + 1) * OutputSize]
+    const float* __restrict__ activatedInputs, // [batchSize][InputSize]
+    float* __restrict__ inputErrors,           // [batchSize][InputSize]
     uint32_t batchSize,
-    uint32_t inputSize,
-    float weightScale, float invWeightScale
-)
+    float weightScale, float invWeightScale)
 {
-    const uint32_t inputIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t batchIdx = blockIdx.y;
-    if (batchIdx >= batchSize || inputIdx >= inputSize) return;
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batchSize * InputSize) return;
 
-    const uint32_t v = trainingVectors[batchIdx].variant;
-    const uint32_t weightsOffset = v * (inputSize + 1);
+    const uint32_t batchIdx = idx / InputSize;
+    const uint32_t inputIdx = idx % InputSize;
 
-    const float error = outputErrors[batchIdx];
-    // Use the same fake-quantized weight as the forward pass (straight-through estimator).
-    const float w = FakeQuantize(weights[weightsOffset + inputIdx], weightScale, invWeightScale);
-    const float x = creluInputs[batchIdx * inputSize + inputIdx];
+    const uint32_t variant = trainingVectors[batchIdx].variant;
+    const float* __restrict__ w = weights + variant * (InputSize + 1) * OutputSize + inputIdx * OutputSize;
 
-    creluErrors[batchIdx * inputSize + inputIdx] = error * w * SCReLUDerivative(x);
+    float error = 0.0f;
+    for (uint32_t o = 0; o < OutputSize; ++o)
+        error += outputGrads[batchIdx * OutputSize + o] * FakeQuantize(w[o], weightScale, invWeightScale);
+
+    inputErrors[idx] = error * CReLUGate(activatedInputs[idx]);
+}
+
+// Backpropagates L1's input gradient through the pairwise product to both feature transformer
+// accumulators. One thread owns a pair, so both halves are written exactly once.
+__global__ void BackpropL1ToAccumulatorKernel(
+    const TrainingEntry* __restrict__ trainingVectors,
+    const float* __restrict__ l1PreErrors,  // [batchSize][L1Size]
+    const float* __restrict__ weights,      // [numVariants][(L1InputSize + 1) * L1Size]
+    const float* __restrict__ accumulators, // [batchSize][2][AccumulatorSize]
+    float* __restrict__ accumulatorErrors,  // [batchSize][2][AccumulatorSize]
+    uint32_t batchSize,
+    float weightScale, float invWeightScale)
+{
+    constexpr uint32_t halfSize = nn::AccumulatorSize / 2;
+
+    // L1InputSize is a multiple of the block size, so every thread of a block shares one batch
+    // element and the block can stage that element's error vector once.
+    __shared__ float s_error[nn::L1Size];
+
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t batchIdx = (blockIdx.x * blockDim.x) / nn::L1InputSize;
+    if (batchIdx >= batchSize) return;
+
+    if (threadIdx.x < nn::L1Size)
+        s_error[threadIdx.x] = l1PreErrors[batchIdx * nn::L1Size + threadIdx.x];
+    __syncthreads();
+
+    const uint32_t elemIdx = idx % nn::L1InputSize;
+
+    const uint32_t variant = trainingVectors[batchIdx].variant;
+    const float* __restrict__ w = weights + variant * (nn::L1InputSize + 1) * nn::L1Size + elemIdx * nn::L1Size;
+
+    // one output row is L1Size contiguous weights; read it four at a time
+    const float4* __restrict__ w4 = reinterpret_cast<const float4*>(w);
+
+    float error = 0.0f;
+    #pragma unroll
+    for (uint32_t o = 0; o < nn::L1Size / 4; ++o)
+    {
+        const float4 wv = w4[o];
+        error += s_error[4 * o + 0] * FakeQuantize(wv.x, weightScale, invWeightScale);
+        error += s_error[4 * o + 1] * FakeQuantize(wv.y, weightScale, invWeightScale);
+        error += s_error[4 * o + 2] * FakeQuantize(wv.z, weightScale, invWeightScale);
+        error += s_error[4 * o + 3] * FakeQuantize(wv.w, weightScale, invWeightScale);
+    }
+
+    // product rule: each half's gradient is scaled by the other half's activation
+    const uint32_t accumulatorBase =
+        2 * batchIdx * nn::AccumulatorSize + (elemIdx / halfSize) * nn::AccumulatorSize;
+    const uint32_t lowIdx = accumulatorBase + elemIdx % halfSize;
+    const uint32_t highIdx = lowIdx + halfSize;
+
+    const float low = accumulators[lowIdx];
+    const float high = accumulators[highIdx];
+
+    accumulatorErrors[lowIdx] = error * CReLU(high) * CReLUGate(low);
+    accumulatorErrors[highIdx] = error * CReLU(low) * CReLUGate(high);
 }
 
 __global__ void FeatureTransformerGradientsKernel(
@@ -426,87 +881,168 @@ __global__ void FeatureTransformerGradientsKernel(
     atomicAdd(&weightGradients[biasGradientIdx], (whitesError + blacksError));
 }
 
-void CudaNeuralNetwork::Backward(CudaBatchData& batch, float learningRate, size_t iteration)
+void CudaNeuralNetwork::Backward(CudaBatchData& batch, float learningRate)
 {
     const uint32_t batchSize = batch.batchSize;
 
+    // The dense gradient kernels accumulate atomically across batch slices
+    batch.l1Gradients.ClearAsync(m_stream.Get());
+    batch.l2Gradients.ClearAsync(m_stream.Get());
+    batch.l3Gradients.ClearAsync(m_stream.Get());
+
     // Compute output layer error (sigmoid derivative)
     {
-        const dim3 blockSize(256);
+        const dim3 blockSize(c_sigmoidDerivativeBlockSize);
         const dim3 gridSize((batchSize + blockSize.x - 1) / blockSize.x);
         SigmoidDerivativeKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
             batch.networkOutputs.Get(),
             batch.trainingVectors.Get(),
             batch.outputErrors.Get(),
+            batch.lossSum.Get(),
             batchSize
         );
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Compute last layer weight gradients
+    // L3 gradients, then backprop to L2's pre-activation
     {
-        const dim3 blockSize(32, 8); // x: input index, y: batch-split for the reduction
-        const dim3 gridSize(((2 * c_accumulatorSize + 1) + blockSize.x - 1) / blockSize.x);
-        const uint32_t sharedBytes = blockSize.x * blockSize.y * c_numVariants * sizeof(float);
-        LastLayerGradientsKernel<<<gridSize, blockSize, sharedBytes, m_stream.Get()>>>(
+        const dim3 blockSize(c_l2Size, 1);
+        const dim3 gridSize(1, c_l3GradientBatchSplits);
+        DenseWeightGradientsKernel<1, nn::L2Size><<<gridSize, blockSize, 0, m_stream.Get()>>>(
             batch.trainingVectors.Get(),
-            batch.accumulatorBuffer.Get(),
+            batch.l2Buffer.Get(),
             batch.outputErrors.Get(),
-            batch.lastLayerGradients.Get(),
+            batch.l3Gradients.Get(),
             batchSize,
-            2 * c_accumulatorSize
+            c_l2Size
         );
         CUDA_CHECK(cudaGetLastError());
     }
-
     {
         const dim3 blockSize(256);
-        const dim3 gridSize((2 * c_accumulatorSize + blockSize.x - 1) / blockSize.x, batchSize);
-        BackpropToCReLUKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
+        const dim3 gridSize((batchSize * c_l2Size + blockSize.x - 1) / blockSize.x);
+        BackpropToHiddenKernel<nn::L2Size, 1><<<gridSize, blockSize, 0, m_stream.Get()>>>(
             batch.trainingVectors.Get(),
             batch.outputErrors.Get(),
-            batch.accumulatorBuffer.Get(),
-            batch.creluErrors.Get(),
-            m_lastLayerWeights->m_weights.Get(),
+            m_l3Weights->m_weights.Get(),
+            batch.l2Buffer.Get(),
+            batch.l2PreErrors.Get(),
             batchSize,
-            2 * c_accumulatorSize,
-            m_lastLayerWeights->m_weightQuantScale,
-            1.0f / m_lastLayerWeights->m_weightQuantScale
+            m_l3Weights->m_weightQuantScale,
+            1.0f / m_l3Weights->m_weightQuantScale
         );
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Compute feature transformer gradients. The buffer was cleared on the aux stream
-    // (overlapping the forward pass); wait for that clear to complete before accumulating.
+    // L2 gradients, then backprop to L1's pre-activation
     {
-        CUDA_CHECK(cudaStreamWaitEvent(m_stream.Get(), m_ftGradClearedEvent, 0));
-
-        const dim3 blockSize(32, 16);
-        const dim3 gridSize(
-            (c_accumulatorSize + blockSize.x - 1) / blockSize.x,
-            (batchSize + blockSize.y - 1) / blockSize.y);
-
-        FeatureTransformerGradientsKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
-            batch.creluErrors.Get(),
+        const dim3 blockSize(c_l1Size, c_l2Size);
+        const dim3 gridSize(1, c_l2GradientBatchSplits);
+        DenseWeightGradientsKernel<nn::L2Size, nn::L1Size><<<gridSize, blockSize, 0, m_stream.Get()>>>(
             batch.trainingVectors.Get(),
-            batch.featureTransformerGradients.Get(),
+            batch.l1Buffer.Get(),
+            batch.l2PreErrors.Get(),
+            batch.l2Gradients.Get(),
             batchSize,
-            c_numNetworkInputs,
-            c_accumulatorSize
+            c_l1Size
         );
         CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        const dim3 blockSize(256);
+        const dim3 gridSize((batchSize * c_l1Size + blockSize.x - 1) / blockSize.x);
+        BackpropToHiddenKernel<nn::L1Size, nn::L2Size><<<gridSize, blockSize, 0, m_stream.Get()>>>(
+            batch.trainingVectors.Get(),
+            batch.l2PreErrors.Get(),
+            m_l2Weights->m_weights.Get(),
+            batch.l1Buffer.Get(),
+            batch.l1PreErrors.Get(),
+            batchSize,
+            m_l2Weights->m_weightQuantScale,
+            1.0f / m_l2Weights->m_weightQuantScale
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // L1 gradients
+    {
+        constexpr uint32_t inputTileSize = 16;
+        const dim3 blockSize(inputTileSize, c_l1Size);
+        const dim3 gridSize(c_l1InputSize / inputTileSize, c_l1GradientBatchSplits);
+        DenseWeightGradientsKernel<nn::L1Size, inputTileSize><<<gridSize, blockSize, 0, m_stream.Get()>>>(
+            batch.trainingVectors.Get(),
+            batch.pairwiseBuffer.Get(),
+            batch.l1PreErrors.Get(),
+            batch.l1Gradients.Get(),
+            batchSize,
+            c_l1InputSize
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // The L1 -> feature transformer backprop and the FT weight gradients are only needed to update
+    // the feature transformer, so both are skipped when it is frozen.
+    if (m_featureTransformerWeights->m_updateWeights)
+    {
+        {
+            const dim3 blockSize(256);
+            static_assert(nn::L1InputSize % 256 == 0 && nn::L1Size % 4 == 0, "");
+            const dim3 gridSize((batchSize * c_l1InputSize + blockSize.x - 1) / blockSize.x);
+            BackpropL1ToAccumulatorKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
+                batch.trainingVectors.Get(),
+                batch.l1PreErrors.Get(),
+                m_l1Weights->m_weights.Get(),
+                batch.accumulatorBuffer.Get(),
+                batch.creluErrors.Get(),
+                batchSize,
+                m_l1Weights->m_weightQuantScale,
+                1.0f / m_l1Weights->m_weightQuantScale
+            );
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Compute feature transformer gradients. The buffer was cleared on the aux stream
+        // (overlapping the forward pass); wait for that clear to complete before accumulating.
+        {
+            CUDA_CHECK(cudaStreamWaitEvent(m_stream.Get(), m_ftGradClearedEvent, 0));
+
+            const dim3 blockSize(32, 16);
+            const dim3 gridSize(
+                (c_accumulatorSize + blockSize.x - 1) / blockSize.x,
+                (batchSize + blockSize.y - 1) / blockSize.y);
+
+            FeatureTransformerGradientsKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
+                batch.creluErrors.Get(),
+                batch.trainingVectors.Get(),
+                batch.featureTransformerGradients.Get(),
+                batchSize,
+                FeatureTransformerInputs,
+                c_accumulatorSize
+            );
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+#if USE_FACTORIZER
+        {
+            const dim3 blockSize(256);
+            const dim3 gridSize((FactorizerInputs * c_accumulatorSize + blockSize.x - 1) / blockSize.x);
+            FactorizerGradientsKernel<<<gridSize, blockSize, 0, m_stream.Get()>>>(
+                batch.featureTransformerGradients.Get(),
+                c_accumulatorSize
+            );
+            CUDA_CHECK(cudaGetLastError());
+        }
+#endif // USE_FACTORIZER
     }
 
     // The training-vectors buffer is no longer read after the FT gradient accumulation (the Adam
     // updates below don't touch it), so signal that the next batch's copy may overwrite it.
     CUDA_CHECK(cudaEventRecord(m_trainConsumedEvent, m_stream.Get()));
 
-    // Update last layer weights
-    m_lastLayerWeights->UpdateAdam(
-        batch.lastLayerGradients.Get(),
-        learningRate,
-        m_stream.Get()
-    );
+    // Update output subnet weights
+    m_l3Weights->UpdateAdam(batch.l3Gradients.Get(), learningRate, m_stream.Get());
+    m_l2Weights->UpdateAdam(batch.l2Gradients.Get(), learningRate, m_stream.Get());
+    m_l1Weights->UpdateAdam(batch.l1Gradients.Get(), learningRate, m_stream.Get());
 
     // Update feature transformer weights
     m_featureTransformerWeights->UpdateAdam(
