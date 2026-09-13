@@ -41,9 +41,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: caissa-android-arm64
-          path: |
-            build/bin/caissa
-            build/bin/eval-ml-5-200B-permuted.pnn
+          path: build/bin/caissa
 
       - name: Create prerelease
         uses: softprops/action-gh-release@v2
@@ -51,8 +49,6 @@ jobs:
           tag_name: android-build-${{ github.run_number }}
           name: Caissa Android Build ${{ github.run_number }}
           prerelease: true
-          files: |
-            build/bin/caissa
-            build/bin/eval-ml-5-200B-permuted.pnn
+          files: build/bin/caissa
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
