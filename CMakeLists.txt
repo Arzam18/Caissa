@@ -8,7 +8,6 @@ string(STRIP "${CAISSA_VERSION}" CAISSA_VERSION)
 message(STATUS "Caissa version: ${CAISSA_VERSION}")
 add_compile_definitions(CAISSA_VERSION="${CAISSA_VERSION}")
 
-
 option(USE_NUMA "Enable NUMA support via libnuma" ON)
 
 if (USE_NUMA AND UNIX AND NOT APPLE)
@@ -31,18 +30,17 @@ if (USE_NUMA AND UNIX AND NOT APPLE)
     endif()
   
     if (NUMA_FOUND)
-		if (NOT TARGET NUMA::numa)
-			add_library(NUMA::numa INTERFACE IMPORTED)
-			target_include_directories(NUMA::numa INTERFACE ${NUMA_INCLUDE_DIRS})
-			target_link_libraries(NUMA::numa INTERFACE ${NUMA_LIBRARIES})
-		endif()
+        if (NOT TARGET NUMA::numa)
+            add_library(NUMA::numa INTERFACE IMPORTED)
+            target_include_directories(NUMA::numa INTERFACE ${NUMA_INCLUDE_DIRS})
+            target_link_libraries(NUMA::numa INTERFACE ${NUMA_LIBRARIES})
+        endif()
         message(STATUS "libnuma found: ${NUMA_LIBRARIES} (includes: ${NUMA_INCLUDE_DIRS})")
         add_definitions(-DUSE_LIBNUMA)
     else()
         message(STATUS "libnuma not found - NUMA support disabled")
     endif()
 endif()
-
 
 # enable IPO (interprocedural optimization) if supported
 include(CheckIPOSupported)
@@ -53,15 +51,14 @@ else()
     message(STATUS "IPO not supported: ${IPO_ERROR}")
 endif()
 
-
 # set supported configurations
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release;Final" CACHE STRING "" FORCE)
 
-IF(NOT CMAKE_BUILD_TYPE)
-   SET(CMAKE_BUILD_TYPE Final
+if(NOT CMAKE_BUILD_TYPE)
+   set(CMAKE_BUILD_TYPE Final
        CACHE STRING "Choose one of build types: Debug Release Final."
        FORCE)
-ENDIF(NOT CMAKE_BUILD_TYPE)
+endif()
 message(STATUS "Current build type: ${CMAKE_BUILD_TYPE}")
 
 # set definitions for each configuration
@@ -137,13 +134,11 @@ endif()
 
 message(STATUS "Current architecture: ${TARGET_ARCH}")
 
-
 # set C/C++ standards
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
-
 
 # optimization flags
 if (MSVC)
@@ -160,9 +155,8 @@ endif()
 
 # linker flags
 if (MSVC)
-	add_link_options(/DEBUG:FULL /OPT:ICF /LTCG)
+    add_link_options(/DEBUG:FULL /OPT:ICF /LTCG)
 endif()
-
 
 set(CMAKE_EXE_LINKER_FLAGS_FINAL "${CMAKE_EXE_LINKER_FLAGS}")
 set(CMAKE_SHARED_LINKER_FLAGS_FINAL "${CMAKE_SHARED_LINKER_FLAGS}")
@@ -171,30 +165,27 @@ set(CMAKE_STATIC_LINKER_FLAGS_FINAL "${CMAKE_STATIC_LINKER_FLAGS}")
 # set max warning level
 if (MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX")
-	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W3")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W3")
 else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror")
-	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror")
 endif()
-
 
 # disable C++ RTTI
 if (MSVC)
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GR-")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GR-")
 else()
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
 endif()
-
 
 # enable multiprocess compilation
 if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
-	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MP")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MP")
 endif()
 
 # warning exceptions
 if (MSVC)
-    # add_compile_options(/W4 /WX /GR-)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-function")
@@ -239,7 +230,10 @@ else()
     message(STATUS "Neural network ${DEFAULT_NEURAL_NET_FILE_NAME} already present, skipping download")
 endif()
 
-# Copy net to build output — for multi-config generators (Visual Studio) copy into each config subdir
+# Pass path definition to Evaluate.cpp so INCBIN embeds the network into the binary
+add_definitions(-DCAISSA_EVALFILE="${NET_SOURCE}")
+
+# Copy net to build output for fallback/standalone usages
 get_property(IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(IS_MULTI_CONFIG)
     foreach(CONFIG_TYPE ${CMAKE_CONFIGURATION_TYPES})
