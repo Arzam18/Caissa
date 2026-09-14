@@ -2,6 +2,10 @@ name: Build Caissa Android
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
 
 permissions:
   contents: write
@@ -11,6 +15,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract engine version
+        run: |
+          VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-${GITHUB_SHA::7}")
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "Building Caissa version: ${VERSION}"
 
       - name: Install Android NDK
         run: |
@@ -18,37 +30,54 @@ jobs:
           unzip -q android-ndk-r26d-linux.zip
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
 
-      - name: Configure
+      - name: Build Caissa (ARM64 v8-A)
         run: |
-          mkdir build
+          mkdir -p build
           cd build
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: |
-          cd build
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a"
           make -j$(nproc)
+          cd ..
+          mv build/bin/caissa caissa-${{ env.VERSION }}-android-arm64-v8a
+
+      - name: Build Caissa (ARM64 DotProd - Cortex A76+)
+        run: |
+          rm -rf build
+          mkdir -p build
+          cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-march=armv8.2-a+dotprod"
+          make -j$(nproc)
+          cd ..
+          mv build/bin/caissa caissa-${{ env.VERSION }}-android-arm64-dotprod
 
       - name: List build output
         run: |
-          ls -la build/bin/
+          ls -lh caissa-${{ env.VERSION }}-android-*
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: caissa-android-arm64
-          path: build/bin/caissa
+          name: caissa-${{ env.VERSION }}-android-binaries
+          path: caissa-${{ env.VERSION }}-android-*
 
       - name: Create prerelease
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: android-build-${{ github.run_number }}
-          name: Caissa Android Build ${{ github.run_number }}
+          tag_name: ${{ env.VERSION }}-android
+          name: Caissa ${{ env.VERSION }} (Android)
           prerelease: true
-          files: build/bin/caissa
+          files: caissa-${{ env.VERSION }}-android-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
