@@ -15,29 +15,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract engine version
-        run: |
-          VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-${GITHUB_SHA::7}")
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
-
       - name: Build Caissa (ARM64 NEON)
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
-          make clean || true
-          make neon CXX="$NDK_CXX" CC="$NDK_CXX" LDFLAGS="-static-libstdc++"
-          mv caissa caissa-${{ env.VERSION }}-android-arm64-neon
-
-      - name: Build Caissa (ARM64 DotProd)
-        run: |
-          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
-          make clean || true
-          make dotprod CXX="$NDK_CXX" CC="$NDK_CXX" LDFLAGS="-static-libstdc++" || make neon CXX="$NDK_CXX" CC="$NDK_CXX" LDFLAGS="-static-libstdc++ -march=armv8.2-a+dotprod"
-          mv caissa caissa-${{ env.VERSION }}-android-arm64-dotprod
+          cd src
+          make neon CC="$NDK_CXX" CXX="$NDK_CXX" LIBS="-static-libstdc++"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: caissa-${{ env.VERSION }}-android-binaries
-          path: |
-            caissa-${{ env.VERSION }}-android-arm64-neon
-            caissa-${{ env.VERSION }}-android-arm64-dotprod
+          name: caissa-android-binaries
+          path: src/caissa-*-aarch64-neon
