@@ -1,94 +1,43 @@
-name: Build Caissa Android
+name: Android
 
 on:
-  workflow_dispatch:
   push:
     branches: [ "*" ]
   pull_request:
     branches: [ "*" ]
-
-permissions:
-  contents: write
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Android NDK
+      - name: Extract engine version
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-          unzip -q android-ndk-r26d-linux.zip
-          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+          VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-${GITHUB_SHA::7}")
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
-      - name: Build Caissa (ARM64 v8-A)
+      - name: Build Caissa (ARM64 NEON)
         run: |
-          mkdir -p build
-          cd build
-          cmake .. \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DANDROID_STL=c++_static \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-march=armv8-a"
-          make -j$(nproc)
-          cd ..
-          mv build/bin/caissa caissa-v8a
+          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          make clean || true
+          make neon CXX="$NDK_CXX" CC="$NDK_CXX" LDFLAGS="-static-libstdc++"
+          mv caissa caissa-${{ env.VERSION }}-android-arm64-neon
 
-      - name: Build Caissa (ARM64 DotProd - Cortex A76+)
+      - name: Build Caissa (ARM64 DotProd)
         run: |
-          rm -rf build
-          mkdir -p build
-          cd build
-          cmake .. \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DANDROID_STL=c++_static \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-march=armv8.2-a+dotprod"
-          make -j$(nproc)
-          cd ..
-          mv build/bin/caissa caissa-dotprod
-
-      - name: Extract Exact UCI Engine Name
-        run: |
-          sudo apt-get update -y && sudo apt-get install -y qemu-user-static
-          
-          RAW_UCI_NAME=$(echo "uci" | qemu-aarch64-static ./caissa-v8a 2>/dev/null | grep "id name" | head -n 1 | cut -d' ' -f3-)
-          
-          if [ -z "$RAW_UCI_NAME" ]; then
-            RAW_UCI_NAME="Caissa-dev-${GITHUB_SHA::7}"
-          fi
-
-          CLEAN_FILENAME=$(echo "$RAW_UCI_NAME" | tr ' ' '-')
-
-          echo "UCI_NAME=${RAW_UCI_NAME}" >> $GITHUB_ENV
-          echo "CLEAN_FILENAME=${CLEAN_FILENAME}" >> $GITHUB_ENV
-
-          # Rename binaries using exact clean UCI string
-          mv caissa-v8a ${CLEAN_FILENAME}-android-arm64-v8a
-          mv caissa-dotprod ${CLEAN_FILENAME}-android-dotprod
-
-      - name: List build output
-        run: |
-          ls -lh ${{ env.CLEAN_FILENAME }}-android-*
+          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          make clean || true
+          make dotprod CXX="$NDK_CXX" CC="$NDK_CXX" LDFLAGS="-static-libstdc++" || make neon CXX="$NDK_CXX" CC="$NDK_CXX" LDFLAGS="-static-libstdc++ -march=armv8.2-a+dotprod"
+          mv caissa caissa-${{ env.VERSION }}-android-arm64-dotprod
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.CLEAN_FILENAME }}-android-binaries
-          path: ${{ env.CLEAN_FILENAME }}-android-*
-
-      - name: Create prerelease
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.CLEAN_FILENAME }}-android
-          name: ${{ env.UCI_NAME }} (Android)
-          prerelease: true
-          files: ${{ env.CLEAN_FILENAME }}-android-*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: caissa-${{ env.VERSION }}-android-binaries
+          path: |
+            caissa-${{ env.VERSION }}-android-arm64-neon
+            caissa-${{ env.VERSION }}-android-arm64-dotprod
