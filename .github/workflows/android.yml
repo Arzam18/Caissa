@@ -23,8 +23,10 @@ jobs:
       - name: Patch Makefile for Clang / NDK
         run: |
           cd src
-          # Remove GCC-specific LTO partition flag that causes Clang to fail
+          # Remove GCC-specific LTO partition flag
           sed -i 's/-flto-partition=one//g' makefile
+          # Enable exceptions required by backend/Memory.hpp
+          sed -i 's/-fno-exceptions/-fexceptions/g' makefile
 
       - name: Build Caissa (ARM64 NEON)
         run: |
