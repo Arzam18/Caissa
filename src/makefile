@@ -47,6 +47,13 @@ else ifneq ($(findstring clang++, $(CC)),)
 	PGO_USE      = -fprofile-instr-use=caissa.profdata
 endif
 
+# set by the pgo target for its two native sub-builds
+ifeq ($(PGO_STEP),generate)
+	PGOFLAGS = $(PGO_GENERATE)
+else ifeq ($(PGO_STEP),use)
+	PGOFLAGS = $(PGO_USE)
+endif
+
 # Try to detect windows environment by seeing
 # whether the shell filters out " or not.
 ifeq ($(shell echo "test"), "test")
@@ -70,7 +77,8 @@ SSE4FLAGS     = $(SSE2FLAGS) -DUSE_SSE4 -DUSE_POPCNT
 AVX2FLAGS     = $(SSE4FLAGS) -DUSE_AVX2
 AVX2VNNIFLAGS = $(AVX2FLAGS) -mavxvnni -DUSE_VNNI
 BMI2FLAGS     = $(AVX2FLAGS) -DUSE_BMI2
-AVX512FLAGS   = $(AVX2FLAGS) -mavx512f -mavx512bw -mavx512dq -DUSE_AVX512
+AVX512FLAGS   = $(BMI2FLAGS) -mavx512f -mavx512bw -mavx512dq -DUSE_AVX512
+AVX512ICLFLAGS = $(AVX512FLAGS) -DUSE_VNNI -DUSE_VBMI2
 NEONFLAGS     = $(COMMONFLAGS) -DUSE_ARM_NEON
 
 # Native build: ask the compiler which ISA extensions -march=native enables on this host,
@@ -90,27 +98,31 @@ else ifneq ($(findstring __aarch64__,$(NATIVE_MACROS)),)
 	NATIVEFLAGS = $(COMMONFLAGS) -march=native -mtune=native \
 	              $(call has-native,__ARM_NEON,-DUSE_ARM_NEON)
 else
+	NATIVE_AVX512 := $(call has-native,__AVX512DQ__,$(call has-native,__AVX512BW__,yes))
+	# AVX-512 builds use the EVEX forms of VNNI and VBMI2, which also need AVX512VL
+	NATIVE_AVX512FLAGS = -DUSE_AVX512 \
+	              $(call has-native,__AVX512VL__,$(call has-native,__AVX512VNNI__,-DUSE_VNNI)) \
+	              $(call has-native,__AVX512VL__,$(call has-native,__AVX512VBMI2__,-DUSE_VBMI2))
 	NATIVEFLAGS = $(COMMONFLAGS) -march=native -mtune=native -DUSE_SSE -DUSE_SSE2 \
 	              $(call has-native,__SSE4_1__,-DUSE_SSE4) \
 	              $(call has-native,__POPCNT__,-DUSE_POPCNT) \
 	              $(call has-native,__AVX__,-DUSE_AVX) \
 	              $(call has-native,__AVX2__,-DUSE_AVX2) \
 	              $(call has-native,__BMI2__,-DUSE_BMI2) \
-	              $(call has-native,__AVXVNNI__,-DUSE_VNNI) \
-	              $(if $(findstring __AVX512DQ__,$(NATIVE_MACROS)),$(call has-native,__AVX512BW__,-DUSE_AVX512))
+	              $(if $(NATIVE_AVX512),$(NATIVE_AVX512FLAGS),$(call has-native,__AVXVNNI__,-DUSE_VNNI))
 endif
 
 %.o: %.cpp
-	$(CC) $(NATIVEFLAGS) -c $< -o $@
+	$(CC) $(NATIVEFLAGS) $(PGOFLAGS) -c $< -o $@
 %.o: %.c
-	$(CC) $(NATIVEFLAGS) -c $< -o $@
+	$(CC) $(NATIVEFLAGS) $(PGOFLAGS) -c $< -o $@
 
 # Evaluate.cpp embeds the net via INCBIN, so it must not be compiled before the download completes
 backend/Evaluate.o: $(EVALFILE)
 
 # for OpenBench
 ob: $(EVALFILE) $(OBJ)
-	$(CC) $(OBJ) $(NATIVEFLAGS) -o $(EXE)$(EXT)
+	$(CC) $(OBJ) $(NATIVEFLAGS) $(PGOFLAGS) -o $(EXE)$(EXT)
 	$(CLEAN_OBJS)
 
 # download the default net file if not present (needed for embedding via INCBIN)
@@ -135,12 +147,22 @@ sse2: $(EVALFILE)
 	$(CC) $(SRC) -march=core2 $(SSE2FLAGS) -o $(EXE_NAME)-x64-sse2$(EXT)
 avx512: $(EVALFILE)
 	$(CC) $(SRC) -march=skylake-avx512 $(AVX512FLAGS) -o $(EXE_NAME)-x64-avx512$(EXT)
+avx512icl: $(EVALFILE)
+	$(CC) $(SRC) -march=icelake-client $(AVX512ICLFLAGS) -o $(EXE_NAME)-x64-avx512icl$(EXT)
 legacy: $(EVALFILE)
 	$(CC) $(SRC) -march=core2 $(SSE2FLAGS) -o $(EXE_NAME)-x64-legacy$(EXT)
 neon: $(EVALFILE)
 	$(CC) $(SRC) -march=armv8-a+simd $(NEONFLAGS) -o $(EXE_NAME)-aarch64-neon$(EXT)
 
 # Profile-guided optimization builds
+# native build like ob; phony because the profile directory has the same name
+.PHONY: pgo
+pgo: $(EVALFILE)
+	$(MAKE) ob PGO_STEP=generate
+	$(BENCH)
+	$(PGO_MERGE)
+	$(MAKE) ob PGO_STEP=use
+	$(CLEAN)
 bmi2_pgo: $(EVALFILE)
 	$(CC) $(SRC) -march=core-avx2 $(BMI2FLAGS) -o $(EXE)$(EXT) $(PGO_GENERATE)
 	$(BENCH)
@@ -157,8 +179,14 @@ avx512_pgo: $(EVALFILE)
 	$(CC) $(SRC) -march=skylake-avx512 $(AVX512FLAGS) -o $(EXE)$(EXT) $(PGO_GENERATE)
 	$(BENCH)
 	$(PGO_MERGE)
-	$(CC) $(SRC) -march=core-avx2 $(AVX512FLAGS) -o $(EXE)$(EXT) $(PGO_USE)
+	$(CC) $(SRC) -march=skylake-avx512 $(AVX512FLAGS) -o $(EXE)$(EXT) $(PGO_USE)
+	$(CLEAN)
+avx512icl_pgo: $(EVALFILE)
+	$(CC) $(SRC) -march=icelake-client $(AVX512ICLFLAGS) -o $(EXE)$(EXT) $(PGO_GENERATE)
+	$(BENCH)
+	$(PGO_MERGE)
+	$(CC) $(SRC) -march=icelake-client $(AVX512ICLFLAGS) -o $(EXE)$(EXT) $(PGO_USE)
 	$(CLEAN)
 
 release:
-	make -j sse2 sse4 avx2 bmi2 avx512
+	make -j sse2 sse4 avx2 bmi2 avx512 avx512icl
