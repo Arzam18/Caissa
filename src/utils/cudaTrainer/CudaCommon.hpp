@@ -1,19 +1,14 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda_runtime_api.h>
-#include <device_launch_parameters.h>
-#include <cuda_fp16.h>
-
-#include <vector>
-#include <memory>
-#include <iostream>
+#include <cstdio>
+#include <cstdlib>
 
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t error = call; \
         if (error != cudaSuccess) { \
-            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << ": " << cudaGetErrorString(error) << std::endl; \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(error)); \
             __debugbreak(); \
             exit(1); \
         } \
@@ -70,7 +65,7 @@ public:
     {
         if (size > m_size)
         {
-            std::cerr << "CudaBuffer::CopyToHost size " << size << " exceeds buffer size " << m_size << std::endl;
+            fprintf(stderr, "CudaBuffer::CopyToHost size %zu exceeds buffer size %zu\n", size, m_size);
             __debugbreak();
             exit(1);
         }

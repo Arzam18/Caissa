@@ -1,7 +1,7 @@
 #include "WeightsStorage.hpp"
-#include "../minitrace/minitrace.h"
 
-#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <random>
 
 namespace nn {
@@ -65,7 +65,7 @@ void WeightsStorage::Init(uint32_t numActiveNeurons, float bias)
     }
 }
 
-void WeightsStorage::PrintStats() const
+WeightsStorage::Stats WeightsStorage::ComputeStats() const
 {
     float minWeight = std::numeric_limits<float>::max();
     float maxWeight = -std::numeric_limits<float>::max();
@@ -117,12 +117,7 @@ void WeightsStorage::PrintStats() const
     weightStdDev = sqrtf(weightStdDev / (m_inputSize * m_outputSize * m_variants.size()));
     biasStdDev = sqrtf(biasStdDev / (m_outputSize * m_variants.size()));
 
-    std::cout
-        << "weight range: [" << minWeight << " ... " << maxWeight
-        << "], bias range: [" << minBias << " ... " << maxBias
-        << "], weight avg: " << weightAvg << ", bias avg: " << biasAvg
-        << ", weight std dev: " << weightStdDev << ", bias std dev: " << biasStdDev
-        << '\n';
+    return { minWeight, maxWeight, weightAvg, weightStdDev, minBias, maxBias, biasAvg, biasStdDev };
 }
 
 } // namespace nn

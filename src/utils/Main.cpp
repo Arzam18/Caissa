@@ -1,11 +1,7 @@
-#include "Common.hpp"
-
 #include "../backend/Tablebase.hpp"
 #include "../backend/Evaluate.hpp"
 
 #include <iostream>
-#include <vector>
-#include <string>
 
 extern void RunUnitTests();
 extern bool RunPerformanceTests(const std::vector<std::string>& paths);
@@ -25,12 +21,11 @@ extern bool PermuteNet(const std::vector<std::string>& args);
 extern bool TrainCudaNetwork(const std::vector<std::string>& args);
 #endif // USE_CUDA
 
-
 int main(int argc, const char* argv[])
 {
 #ifdef _MSC_VER
     // increase max open files limit (required for neural net training)
-    _setmaxstdio(4096);
+    _setmaxstdio(8192);
 #endif // _MSC_VER
 
     std::vector<std::string> args;

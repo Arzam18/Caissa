@@ -1,80 +1,10 @@
 #pragma once
 
-#include "CudaCommon.hpp"
+#include "CudaKernels.hpp"
 #include "CudaWeightsStorage.hpp"
-#include "../TrainerCommon.hpp"
-#include "../../backend/PackedNeuralNetwork.hpp"
-
-// Input factorizer: a shared 768-feature weight block (king-bucket independent) that is added to the
-// weights of every king bucket during training and folded into them when the net is packed.
-// TODO make it runtime switch instead of compile-time
-#define USE_FACTORIZER 1
 
 namespace nn {
 namespace cuda {
-
-static constexpr uint32_t FactorizerInputs = 12 * 64;
-#if USE_FACTORIZER
-static constexpr uint32_t FeatureTransformerInputs = nn::NumNetworkInputs + FactorizerInputs;
-#else
-static constexpr uint32_t FeatureTransformerInputs = nn::NumNetworkInputs;
-#endif // USE_FACTORIZER
-
-// factorizer weights are clipped so that their sum with the (unclipped) bucket weights stays bounded
-static constexpr float FactorizerWeightRange = 0.99f;
-
-struct CudaBatchData
-{
-    CudaBuffer<TrainingEntry> trainingVectors;
-    CudaBuffer<float> networkOutputs;       // post-sigmoid output
-    CudaBuffer<float> outputErrors;         // dLoss / d(pre-sigmoid output)
-    CudaBuffer<float> lossSum;              // sum of squared output errors, accumulated across batches
-
-    // Forward activations. accumulatorBuffer holds the raw (pre-activation) feature transformer
-    // output; every later buffer holds the post-activation value.
-    CudaBuffer<float> accumulatorBuffer;    // [batch][2][AccumulatorSize]
-    CudaBuffer<float> pairwiseBuffer;       // [batch][L1InputSize]
-    CudaBuffer<float> l1Buffer;             // [batch][L1Size]
-    CudaBuffer<float> l2Buffer;             // [batch][L2Size]
-    CudaBuffer<float> l3Buffer;             // [batch] (pre-sigmoid)
-
-    // dLoss / d(pre-activation) of the hidden layers
-    CudaBuffer<float> l1PreErrors;          // [batch][L1Size]
-    CudaBuffer<float> l2PreErrors;          // [batch][L2Size]
-
-    // Weight gradients. Each must match its weight storage element count exactly,
-    // (inputSize + 1) * outputSize * numVariants - the "+1" row holds the per-output biases.
-    CudaBuffer<float> l1Gradients;
-    CudaBuffer<float> l2Gradients;
-    CudaBuffer<float> l3Gradients;
-    CudaBuffer<float> featureTransformerGradients;
-
-    uint32_t batchSize;
-
-    void Allocate(uint32_t size)
-    {
-        batchSize = size;
-
-        trainingVectors.Allocate(batchSize);
-        networkOutputs.Allocate(batchSize);
-        outputErrors.Allocate(batchSize);
-        lossSum.Allocate(1);
-
-        accumulatorBuffer.Allocate(batchSize * 2 * nn::AccumulatorSize);
-        pairwiseBuffer.Allocate(batchSize * nn::L1InputSize);
-        l1Buffer.Allocate(batchSize * nn::L1Size);
-        l2Buffer.Allocate(batchSize * nn::L2Size);
-        l3Buffer.Allocate(batchSize);
-
-        l1PreErrors.Allocate(batchSize * nn::L1Size);
-        l2PreErrors.Allocate(batchSize * nn::L2Size);
-
-        l1Gradients.Allocate((nn::L1InputSize + 1) * nn::L1Size * nn::NumVariants);
-        l2Gradients.Allocate((nn::L1Size + 1) * nn::L2Size * nn::NumVariants);
-        l3Gradients.Allocate((nn::L2Size + 1) * 1 * nn::NumVariants);
-        featureTransformerGradients.Allocate((FeatureTransformerInputs + 1) * nn::AccumulatorSize);
-    }
-};
 
 class CudaNeuralNetwork
 {
@@ -89,15 +19,14 @@ public:
 
     // Replace the weights with a random initialization (training from scratch)
     void InitRandomWeights(uint32_t seed);
-    // Random initialization of the output subnets only, keeping the feature transformer
-    // (used when warm starting the feature transformer from an existing single-layer net)
-    void InitRandomOutputSubnetWeights(uint32_t seed);
 
     void Forward(CudaBatchData& batch);
     void Backward(CudaBatchData& batch, float learningRate);
 
     // Set per-layer AdamW weight decay (applied to weights only, not biases).
     void SetWeightDecay(float featureTransformerDecay, float outputSubnetDecay);
+
+    void SetAdamBetas(float beta1, float beta2);
 
     // A frozen feature transformer keeps its weights and skips its backward pass, so only the output
     // subnets train.
@@ -139,6 +68,9 @@ public:
     static constexpr uint32_t c_l2Size = nn::L2Size;
 
 private:
+    // Random initialization of the output subnets, part of InitRandomWeights
+    void InitRandomOutputSubnetWeights(uint32_t seed);
+
     // CUDA weight storages. The feature transformer has a single variant; each output subnet
     // layer has one per output bucket.
     CudaWeightsStoragePtr m_featureTransformerWeights;
