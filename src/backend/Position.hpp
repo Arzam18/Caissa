@@ -2,8 +2,10 @@
 
 #include "PositionHash.hpp"
 #include "Memory.hpp"
+#include "Move.hpp"
+#include "containers/String.hpp"
 
-#include <vector>
+using FenString = FixedString<128>;
 
 // class representing one side's pieces state
 struct alignas(16) SidePosition
@@ -11,12 +13,12 @@ struct alignas(16) SidePosition
     INLINE Piece GetPieceAtSquare(const Square square) const
     {
         ASSERT(square.IsValid());
-        const Piece piece = pieces[square.mIndex];
 
-        if (piece != Piece::None)
-            ASSERT(GetPieceBitBoard(piece).IsBitSet(square.mIndex));
-
-        return piece;
+        // each bit of the Piece value is the union of the bitboards of pieces that have it set
+        const uint32_t bit0 = (uint32_t)(((pawns | bishops | queens) >> square.mIndex) & 1);
+        const uint32_t bit1 = (uint32_t)(((knights | bishops | king) >> square.mIndex) & 1);
+        const uint32_t bit2 = (uint32_t)(((rooks | queens | king) >> square.mIndex) & 1);
+        return (Piece)(bit0 | (bit1 << 1) | (bit2 << 2));
     }
 
     Bitboard& GetPieceBitBoard(Piece piece);
@@ -66,7 +68,6 @@ struct alignas(16) SidePosition
     Bitboard rooks = 0;
     Bitboard queens = 0;
     Bitboard king = 0;
-    Piece pieces[64] = {};
 };
 
 INLINE Bitboard& SidePosition::GetPieceBitBoard(Piece piece)
@@ -131,26 +132,25 @@ public:
         return *this;
     }
 
-    explicit Position(const std::string& fenString);
+    explicit Position(const char* fenString);
 
     // compare position (not hash)
     bool operator == (const Position& rhs) const;
-    bool operator != (const Position& rhs) const;
 
     // load position from Forsyth-Edwards Notation
-    bool FromFEN(const std::string& fenString);
+    bool FromFEN(const char* fenString);
 
     // save position to Forsyth-Edwards Notation
-    std::string ToFEN(bool skipMoveCounts = false) const;
+    FenString ToFEN(bool skipMoveCounts = false) const;
 
     // print board as ASCI art
-    std::string Print() const;
+    String Print() const;
 
     // convert move to string
-    std::string MoveToString(const Move& move, MoveNotation notation = MoveNotation::SAN) const;
+    MoveString MoveToString(const Move& move, MoveNotation notation = MoveNotation::SAN) const;
 
     // parse move from string
-    Move MoveFromString(const std::string& str, MoveNotation notation = MoveNotation::LAN) const;
+    Move MoveFromString(const char* str, MoveNotation notation = MoveNotation::LAN) const;
 
     // parse move from packed move
     Move MoveFromPacked(const PackedMove& packedMove) const;
@@ -163,17 +163,10 @@ public:
 
     // update en passant square
     void SetEnPassantSquare(const Square square);
-    void ClearEnPassantSquare();
 
     // check if board state is valid (no double checks etc.)
     // strict mode checks if the position is "normal" chess position (proper piece count, proper pawn placement, etc.)
     bool IsValid(bool strict = false) const;
-
-    // get pieces attacking given square
-    const Bitboard GetAttackers(const Square square, const Bitboard occupied) const;
-
-    // get pieces of one side attacking given square
-    const Bitboard GetAttackers(const Square square, const Color sideColor) const;
 
     // check if given square is visible by any other piece
     bool IsSquareVisible(const Square square, const Color sideColor) const;
@@ -188,8 +181,8 @@ public:
     // approximate, does not handle discovered checks, check by castling, etc.
     bool GivesCheck_Approx(const Move move) const;
 
-    // get number of legal moves
-    uint32_t GetNumLegalMoves(std::vector<Move>* outMoves = nullptr) const;
+    // get number of legal moves, optionally fill outMoves with all legal moves
+    uint32_t GetNumLegalMoves(MoveList* outMoves = nullptr) const;
 
     // check if side to move is checkmated
     bool IsMate() const;
@@ -205,7 +198,6 @@ public:
     
     // Check if a move is valid pseudomove. This is a partial test, it does not include checks/checkmates.
     bool IsMoveValid(const Move& move) const;
-    bool IsMoveValid_Fast(const PackedMove& move) const;
 
     // Approximate check if packed move is a capture
     bool IsCapture(const PackedMove& move) const;
@@ -223,9 +215,6 @@ public:
 
     // apply null move
     bool DoNullMove();
-
-    // check what is theoretically possible best move value (without generating and analyzing actual moves)
-    int32_t BestPossibleMoveValue() const;
 
     // evaluate material exchange on a single square
     bool StaticExchangeEvaluation(const Move& move, int32_t treshold = 0) const;
@@ -258,7 +247,6 @@ public:
 
     INLINE uint8_t GetWhitesCastlingRights() const { return mCastlingRights[0]; }
     INLINE uint8_t GetBlacksCastlingRights() const { return mCastlingRights[1]; }
-    INLINE uint8_t GetOurCastlingRights() const { return mCastlingRights[(uint32_t)mSideToMove]; }
 
     INLINE uint32_t GetNumPiecesExcludingKing() const
     {
@@ -274,7 +262,6 @@ public:
 
     // get occupied squares bitboard
     INLINE Bitboard Occupied() const { return Whites().Occupied() | Blacks().Occupied(); }
-    INLINE Bitboard OccupiedExcludingKing() const { return Whites().OccupiedExcludingKing() | Blacks().OccupiedExcludingKing(); }
 
     // get board hash
     INLINE uint64_t GetHash() const { return mHash; }
@@ -339,7 +326,7 @@ private:
     uint32_t mNonPawnsHash[2];
 };
 
-static_assert(sizeof(Position) <= 256, "Invalid position size");
+static_assert(sizeof(Position) <= 128, "Invalid position size");
 
 static constexpr uint8_t c_shortCastleMask = (1 << 7);
 static constexpr uint8_t c_longCastleMask = (1 << 0);

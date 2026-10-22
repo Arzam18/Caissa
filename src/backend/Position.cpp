@@ -72,7 +72,6 @@ void Position::SetPiece(const Square square, const Piece piece, const Color colo
     ASSERT((pos.rooks & mask) == 0);
     ASSERT((pos.queens & mask) == 0);
     ASSERT((pos.king & mask) == 0);
-    ASSERT(pos.pieces[square.Index()] == Piece::None);
 
     const uint64_t pieceHash = GetPieceZobristHash(color, piece, square.Index());
     mHash ^= pieceHash;
@@ -84,7 +83,6 @@ void Position::SetPiece(const Square square, const Piece piece, const Color colo
         mNonPawnsHash[Black] ^= (uint32_t)pieceHash;
 
     pos.GetPieceBitBoard(piece) |= mask;
-    pos.pieces[square.Index()] = piece;
 }
 
 void Position::RemovePiece(const Square square, const Piece piece, const Color color)
@@ -95,9 +93,6 @@ void Position::RemovePiece(const Square square, const Piece piece, const Color c
 
     ASSERT((targetBitboard & mask) == mask);
     targetBitboard &= ~mask;
-
-    ASSERT(pos.pieces[square.Index()] == piece);
-    pos.pieces[square.Index()] = Piece::None;
 
     const uint64_t pieceHash = GetPieceZobristHash(color, piece, square.Index());
     mHash ^= pieceHash;
@@ -176,16 +171,6 @@ void Position::SetEnPassantSquare(const Square square)
     }
 }
 
-void Position::ClearEnPassantSquare()
-{
-    if (mEnPassantSquare.IsValid())
-    {
-        mHash ^= GetEnPassantFileZobristHash(mEnPassantSquare.File());
-    }
-
-    mEnPassantSquare = Square::Invalid();
-}
-
 Bitboard Position::GetAttackedSquares(Color side) const
 {
     const SidePosition& currentSide = mColors[(uint8_t)side];
@@ -254,39 +239,6 @@ Square Position::GetShortCastleRookSquare(const Square kingSquare, uint8_t castl
     }
 
     return Square::Invalid();
-}
-
-const Bitboard Position::GetAttackers(const Square square, const Bitboard occupied) const
-{
-    const Bitboard knights  = Whites().knights | Blacks().knights;
-    const Bitboard bishops  = Whites().bishops | Blacks().bishops;
-    const Bitboard rooks    = Whites().rooks | Blacks().rooks;
-    const Bitboard queens   = Whites().queens | Blacks().queens;
-    const Bitboard kings    = Whites().king | Blacks().king;
-
-    Bitboard bitboard       = Bitboard::GetKingAttacks(square) & kings;
-    if (knights)            bitboard |= Bitboard::GetKnightAttacks(square) & knights;
-    if (rooks | queens)     bitboard |= Bitboard::GenerateRookAttacks(square, occupied) & (rooks | queens);
-    if (bishops | queens)   bitboard |= Bitboard::GenerateBishopAttacks(square, occupied) & (bishops | queens);
-    if (Whites().pawns)     bitboard |= Bitboard::GetPawnAttacks(square, Black) & Whites().pawns;
-    if (Blacks().pawns)     bitboard |= Bitboard::GetPawnAttacks(square, White) & Blacks().pawns;
-
-    return bitboard;
-}
-
-const Bitboard Position::GetAttackers(const Square square, const Color color) const
-{
-    const SidePosition& side = GetSide(color);
-    const Bitboard occupiedSquares = Whites().Occupied() | Blacks().Occupied();
-
-    Bitboard bitboard = Bitboard::GetKingAttacks(square) & side.king;
-
-    if (side.knights)               bitboard |= Bitboard::GetKnightAttacks(square) & side.knights;
-    if (side.rooks | side.queens)   bitboard |= Bitboard::GenerateRookAttacks(square, occupiedSquares) & (side.rooks | side.queens);
-    if (side.bishops | side.queens) bitboard |= Bitboard::GenerateBishopAttacks(square, occupiedSquares) & (side.bishops | side.queens);
-    if (side.pawns)                 bitboard |= Bitboard::GetPawnAttacks(square, color ^ 1) & side.pawns;
-
-    return bitboard;
 }
 
 bool Position::IsSquareVisible(const Square square, const Color color) const
@@ -373,10 +325,15 @@ bool Position::GivesCheck_Approx(const Move move) const
     return false;
 }
 
-uint32_t Position::GetNumLegalMoves(std::vector<Move>* outMoves) const
+uint32_t Position::GetNumLegalMoves(MoveList* outMoves) const
 {
     MoveList moves;
     GenerateMoveList(*this, Bitboard::GetKingAttacks(GetOpponentSide().GetKingSquare()), moves);
+
+    if (outMoves)
+    {
+        outMoves->Clear();
+    }
 
     if (moves.Size() == 0)
     {
@@ -396,7 +353,7 @@ uint32_t Position::GetNumLegalMoves(std::vector<Move>* outMoves) const
 
             if (outMoves)
             {
-                outMoves->push_back(move);
+                outMoves->Push(move);
             }
         }
     }
@@ -680,16 +637,6 @@ Position Position::SwappedColors() const
     result.mColors[1].knights       = mColors[0].knights.MirroredVertically();
     result.mColors[1].pawns         = mColors[0].pawns.MirroredVertically();
 
-    // flip pieces
-    for (uint32_t rank = 0; rank < 8; ++rank)
-    {
-        for (uint32_t file = 0; file < 8; ++file)
-        {
-            result.mColors[1].pieces[rank * 8 + file] = mColors[0].pieces[(7 - rank) * 8 + file];
-            result.mColors[0].pieces[rank * 8 + file] = mColors[1].pieces[(7 - rank) * 8 + file];
-        }
-    }
-
     result.mCastlingRights[0]       = mCastlingRights[1];
     result.mCastlingRights[1]       = mCastlingRights[0];
     result.mSideToMove              = mSideToMove ^ 1;
@@ -828,28 +775,6 @@ static const int32_t bishopValue = 300;
 static const int32_t rookValue = 500;
 static const int32_t queenValue = 900;
 static const int32_t kingValue = INT32_MAX;
-
-int32_t Position::BestPossibleMoveValue() const
-{
-    int32_t value = 0;
-
-    const SidePosition& side = GetOpponentSide();
-
-    // can capture most valuable piece
-         if (side.queens)   value = std::max(c_queenValue.mg, c_queenValue.eg);
-    else if (side.rooks)    value = std::max(c_rookValue.mg, c_rookValue.eg);
-    else if (side.knights)  value = std::max(c_knightValue.mg, c_knightValue.eg);
-    else if (side.bishops)  value = std::max(c_bishopValue.mg, c_bishopValue.eg);
-    else if (side.pawns)    value = std::max(c_pawnValue.mg, c_pawnValue.eg);
-
-    // can promote to queen
-    if (GetCurrentSide().pawns & (mSideToMove == White ? Bitboard::RankBitboard<6>() : Bitboard::RankBitboard<1>()))
-    {
-        value += std::max(c_queenValue.mg, c_queenValue.eg) - std::min(c_pawnValue.mg, c_pawnValue.eg);
-    }
-
-    return value;
-}
 
 static const int32_t c_seePieceValues[] =
 {

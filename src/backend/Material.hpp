@@ -1,8 +1,6 @@
 #pragma once
 
-#include "Common.hpp"
-
-#include <string>
+#include "containers/String.hpp"
 
 union MaterialKey
 {
@@ -63,11 +61,6 @@ union MaterialKey
             (uint32_t)numBlackPawns + (uint32_t)numBlackKnights + (uint32_t)numBlackBishops + (uint32_t)numBlackRooks + (uint32_t)numBlackQueens;
     }
 
-    INLINE constexpr bool IsSymetric() const
-    {
-        return (value & 0x3FFFFFFF) == (value >> 30);
-    }
-
     INLINE constexpr MaterialKey SwappedColors() const
     {
         const uint64_t whitesValue = (value >> 30) & 0x3FFFFFFFull;
@@ -75,26 +68,8 @@ union MaterialKey
         return MaterialKey(whitesValue | blacksValue);
     }
 
-    INLINE uint32_t GetActivePiecesCount() const
-    {
-        uint32_t count = 0;
-        count += numWhitePawns > 0 ? 1 : 0;
-        count += numWhiteKnights > 0 ? 1 : 0;
-        count += numWhiteBishops > 0 ? 1 : 0;
-        count += numWhiteRooks > 0 ? 1 : 0;
-        count += numWhiteQueens > 0 ? 1 : 0;
-        count += numBlackPawns > 0 ? 1 : 0;
-        count += numBlackKnights > 0 ? 1 : 0;
-        count += numBlackBishops > 0 ? 1 : 0;
-        count += numBlackRooks > 0 ? 1 : 0;
-        count += numBlackQueens > 0 ? 1 : 0;
-        return count;
-    }
-
-    uint32_t GetNeuralNetworkInputsNumber() const;
-
     void FromString(const char* str);
-    std::string ToString() const;
+    String ToString() const;
 };
 
 ///
@@ -131,26 +106,3 @@ INLINE MaterialMask FlipColor(const MaterialMask mask)
 {
     return MaterialMask((mask >> 5) | ((mask & 0x1F) << 5));
 }
-
-///
-
-namespace std
-{
-
-template <>
-struct hash<MaterialKey>
-{
-    INLINE std::size_t operator()(const MaterialKey& k) const
-    {
-        if constexpr (sizeof(std::size_t) == sizeof(MaterialKey))
-        {
-            return k.value;
-        }
-        else
-        {
-            return std::hash<uint64_t>{}(k.value);
-        }
-    }
-};
-
-} // namespace std
