@@ -20,6 +20,12 @@
 #define CAISSA_VERSION "unknown"
 #endif // CAISSA_VERSION
 
+#ifdef CAISSA_BUILD_DATE
+#define BuildDateStr " [" CAISSA_BUILD_DATE "]"
+#else
+#define BuildDateStr ""
+#endif
+
 #if defined(USE_AVX512) && defined(USE_BMI2) && defined(USE_VNNI) && defined(USE_VBMI2)
 #define ArchitectureStr "AVX-512 ICL"
 #elif defined(USE_AVX512)
@@ -52,7 +58,7 @@
 #define TuningStr ""
 #endif
 
-static const char* c_EngineName = "Caissa " CAISSA_VERSION " " ArchitectureStr ConfigurationStr TuningStr;
+static const char* c_EngineName = "Caissa " CAISSA_VERSION " " ArchitectureStr ConfigurationStr TuningStr BuildDateStr;
 static const char* c_Author = "Michal Witanowski";
 
 // TODO set TT size based on current memory usage / total memory size
