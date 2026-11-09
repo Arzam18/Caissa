@@ -35,7 +35,13 @@ else
 	LIBS += -lpthread
 endif
 
-ifneq ($(findstring g++, $(CC)),)
+# Check Clang before GCC: NDK compiler names such as aarch64-linux-android28-clang++
+# end in "g++", so testing for g++ first incorrectly enables GCC-only flags.
+ifneq ($(findstring clang++, $(notdir $(firstword $(CC)))),)
+	PGO_MERGE    = llvm-profdata merge -output=caissa.profdata *.profraw
+	PGO_GENERATE = -fprofile-instr-generate
+	PGO_USE      = -fprofile-instr-use=caissa.profdata
+else ifneq ($(findstring g++, $(notdir $(firstword $(CC)))),)
 	# no loop peeling (and no tracer with a profile): the code they duplicate slows the build down
 	FLAGS += -fno-peel-loops
 	# without a profile, the blocks GCC guesses as cold (and moves to a separate section) still run often
@@ -47,10 +53,6 @@ ifneq ($(findstring g++, $(CC)),)
 	# the profile run is single-threaded, so plain counter increments (not the atomic ones -pthread implies) are exact
 	PGO_GENERATE = -fprofile-generate=$(PGO_DIR) -fprofile-update=single -flto=auto -flto-partition=balanced
 	PGO_USE      = -fprofile-use=$(PGO_DIR) -fno-tracer -freorder-blocks-and-partition
-else ifneq ($(findstring clang++, $(CC)),)
-	PGO_MERGE    = llvm-profdata merge -output=caissa.profdata *.profraw
-	PGO_GENERATE = -fprofile-instr-generate
-	PGO_USE      = -fprofile-instr-use=caissa.profdata
 endif
 
 # set by the pgo targets for their two sub-builds
@@ -84,7 +86,11 @@ else
 	MOVE_NET = mv -f $(NET_TMP) $(DEFAULT_EVALFILE)
 endif
 
-COMMONFLAGS   = $(FLAGS) $(LIBS) -DCONFIGURATION_FINAL -DNDEBUG -DCAISSA_VERSION=\"$(VERSION)\" -DCAISSA_EVALFILE=\"$(EVALFILE)\"
+ifneq ($(strip $(UCI_DATE)),)
+	BUILD_DATE_FLAGS = -DCAISSA_BUILD_DATE=\"$(UCI_DATE)\"
+endif
+
+COMMONFLAGS   = $(FLAGS) $(LIBS) $(BUILD_DATE_FLAGS) -DCONFIGURATION_FINAL -DNDEBUG -DCAISSA_VERSION=\"$(VERSION)\" -DCAISSA_EVALFILE=\"$(EVALFILE)\"
 
 SSE2FLAGS     = $(COMMONFLAGS) -DUSE_SSE -DUSE_SSE2
 SSE4FLAGS     = $(SSE2FLAGS) -DUSE_SSE4 -DUSE_POPCNT
