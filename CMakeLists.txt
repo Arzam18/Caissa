@@ -152,7 +152,11 @@ endif()
 
 # linker flags
 if (MSVC)
-	add_link_options(/DEBUG:FULL /OPT:ICF /LTCG)
+	add_link_options(/DEBUG:FULL /OPT:ICF $<$<CONFIG:Final>:/LTCG>)
+	# with the static runtime, link the UCRT from Windows (ucrtbase.dll) instead: the exe stays standalone and is much smaller
+	if (CMAKE_MSVC_RUNTIME_LIBRARY STREQUAL "MultiThreaded")
+		add_link_options(/NODEFAULTLIB:libucrt.lib ucrt.lib)
+	endif()
 endif()
 
 
@@ -175,6 +179,12 @@ if (MSVC)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GR-")
 else()
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+endif()
+
+
+# C++ exceptions are disabled per target: backend and frontend do not use them, utils and trainer enable them for the STL
+if (MSVC)
+	string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 endif()
 
 
@@ -206,7 +216,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Download neural net to data/neuralNets/ once (shared across all build dirs and configurations)
-set(NET_VERSION "eval-ml-11a-100B-spsa-transplant")
+set(NET_VERSION "eval-ml-14-q16-80B-spsa-transplant")
 set(DEFAULT_NEURAL_NET_FILE_NAME "${NET_VERSION}.pnn")
 set(NET_DOWNLOAD_URL "https://github.com/Witek902/Caissa-Nets/releases/download/${NET_VERSION}/${DEFAULT_NEURAL_NET_FILE_NAME}")
 set(NET_SOURCE "${CMAKE_SOURCE_DIR}/data/neuralNets/${DEFAULT_NEURAL_NET_FILE_NAME}")

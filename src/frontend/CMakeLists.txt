@@ -2,7 +2,13 @@ file(GLOB CAISSA_SOURCES *.cpp)
 
 add_executable(caissa ${CAISSA_SOURCES})
 
-set_property(TARGET caissa PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+set_property(TARGET caissa PROPERTY INTERPROCEDURAL_OPTIMIZATION_FINAL TRUE)
+
+if (MSVC)
+	target_compile_options(caissa PRIVATE /EHs-c-)
+else()
+	target_compile_options(caissa PRIVATE -fno-exceptions)
+endif()
 
 add_dependencies(caissa backend)
 
