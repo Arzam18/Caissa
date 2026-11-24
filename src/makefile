@@ -25,7 +25,7 @@ else
 endif
 
 WFLAGS = -Wall -Wno-unused-function -Wno-switch -Wno-attributes -Wno-missing-field-initializers -Wno-multichar
-FLAGS = $(WFLAGS) -g1 -flto -flto-partition=one -std=c++20 -O3 -fno-rtti -fno-exceptions -fomit-frame-pointer -fno-math-errno -fno-trapping-math -fno-stack-protector
+FLAGS = $(WFLAGS) -g1 -flto -std=c++20 -O3 -fno-rtti -fno-exceptions -fomit-frame-pointer -fno-math-errno -fno-trapping-math -fno-stack-protector
 LIBS =
 
 ifeq ($(EXT), .exe)
@@ -41,7 +41,16 @@ ifeq ($(NUMA),1)
 	LIBS += -lnuma
 endif
 
-ifneq ($(findstring g++, $(CC)),)
+# Detect Clang before GCC: Android NDK compiler names end in clang++, which also
+# contains the substring "g++". GCC-only flags must never reach the NDK compiler.
+COMPILER_BASENAME := $(notdir $(firstword $(CC)))
+ifneq ($(findstring clang++,$(COMPILER_BASENAME)),)
+	PGO_MERGE    = llvm-profdata merge -output=caissa.profdata *.profraw
+	PGO_GENERATE = -fprofile-instr-generate
+	PGO_USE      = -fprofile-instr-use=caissa.profdata
+else ifneq ($(findstring g++,$(COMPILER_BASENAME)),)
+	# GCC-only LTO partitioning and loop optimizations.
+	FLAGS += -flto-partition=one
 	# no loop peeling (and no tracer with a profile): the code they duplicate slows the build down
 	FLAGS += -fno-peel-loops
 	# without a profile, the blocks GCC guesses as cold (and moves to a separate section) still run often
@@ -53,10 +62,6 @@ ifneq ($(findstring g++, $(CC)),)
 	# the profile run is single-threaded, so plain counter increments (not the atomic ones -pthread implies) are exact
 	PGO_GENERATE = -fprofile-generate=$(PGO_DIR) -fprofile-update=single -flto=auto -flto-partition=balanced
 	PGO_USE      = -fprofile-use=$(PGO_DIR) -fno-tracer -freorder-blocks-and-partition
-else ifneq ($(findstring clang++, $(CC)),)
-	PGO_MERGE    = llvm-profdata merge -output=caissa.profdata *.profraw
-	PGO_GENERATE = -fprofile-instr-generate
-	PGO_USE      = -fprofile-instr-use=caissa.profdata
 endif
 
 # set by the pgo targets for their two sub-builds
@@ -90,7 +95,11 @@ else
 	MOVE_NET = mv -f $(NET_TMP) $(DEFAULT_EVALFILE)
 endif
 
-COMMONFLAGS   = $(FLAGS) $(LIBS) -DCONFIGURATION_FINAL -DNDEBUG -DCAISSA_VERSION=\"$(VERSION)\" -DCAISSA_EVALFILE=\"$(EVALFILE)\"
+ifneq ($(strip $(UCI_DATE)),)
+	BUILD_DATE_FLAGS = -DCAISSA_BUILD_DATE=\"$(UCI_DATE)\"
+endif
+
+COMMONFLAGS   = $(FLAGS) $(LIBS) $(BUILD_DATE_FLAGS) -DCONFIGURATION_FINAL -DNDEBUG -DCAISSA_VERSION=\"$(VERSION)\" -DCAISSA_EVALFILE=\"$(EVALFILE)\"
 
 SSE2FLAGS     = $(COMMONFLAGS) -DUSE_SSE -DUSE_SSE2
 SSE4FLAGS     = $(SSE2FLAGS) -DUSE_SSE4 -DUSE_POPCNT
@@ -182,8 +191,14 @@ avx512icl: $(EVALFILE)
 	$(CC) $(SRC) -march=icelake-client $(AVX512ICLFLAGS) -o $(EXE_NAME)-x64-avx512icl$(EXT)
 legacy: $(EVALFILE)
 	$(CC) $(SRC) -march=core2 $(SSE2FLAGS) -o $(EXE_NAME)-x64-legacy$(EXT)
+.PHONY: neon dotprod
 neon: $(EVALFILE)
 	$(CC) $(SRC) -march=armv8-a+simd $(NEONFLAGS) -o $(EXE_NAME)-aarch64-neon$(EXT)
+
+# Requires ARMv8.2-A Dot Product support (SDOT). Keep this as a separate binary
+# so the baseline NEON build remains compatible with ARMv8-A devices.
+dotprod: $(EVALFILE)
+	$(CC) $(SRC) -march=armv8.2-a+dotprod $(NEONFLAGS) -o $(EXE_NAME)-aarch64-dotprod$(EXT)
 
 # Profile-guided optimization builds
 # native build like ob; phony because the profile directory has the same name
