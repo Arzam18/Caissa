@@ -29,7 +29,9 @@
 #define ArchitectureStr "AVX2"
 #elif defined(USE_POPCNT) &&  defined(USE_SSE4) 
 #define ArchitectureStr "POPCNT"
-#elif defined(USE_ARM_NEON) 
+#elif defined(USE_ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#define ArchitectureStr "ARM NEON DotProd"
+#elif defined(USE_ARM_NEON)
 #define ArchitectureStr "ARM NEON"
 #else
 #define ArchitectureStr "legacy"
@@ -51,7 +53,13 @@
 #define TuningStr ""
 #endif
 
-static const char* c_EngineName = "Caissa " CAISSA_VERSION " " ArchitectureStr ConfigurationStr TuningStr;
+#ifdef CAISSA_BUILD_DATE
+#define BuildDateStr " [" CAISSA_BUILD_DATE "]"
+#else
+#define BuildDateStr ""
+#endif
+
+static const char* c_EngineName = "Caissa " CAISSA_VERSION " " ArchitectureStr ConfigurationStr TuningStr BuildDateStr;
 static const char* c_Author = "Michal Witanowski";
 
 // TODO set TT size based on current memory usage / total memory size
